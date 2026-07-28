@@ -1,4 +1,5 @@
-@echo off
+﻿@echo off
+chcp 65001 >nul
 REM ============================================================
 REM  MATLAB MCP Server - Windows 服务安装脚本
 REM  使用 NSSM 将服务注册为 Windows 服务（开机自启动）

@@ -1,4 +1,5 @@
-@echo off
+﻿@echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 REM ============================================================
 REM  MATLAB MCP Server - 快速启动脚本
