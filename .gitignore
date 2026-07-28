@@ -1,0 +1,62 @@
+# MATLAB MCP Server 项目 .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 日志（使用 LOG_DIR 绝对路径，但以防万一）
+*.log
+logs/
+
+# MATLAB 临时文件
+*.asv
+*.autosave
+*.m~
+
+# MCP 运行时临时文件
+_task_*_progress.txt
+_mcp_lint_tmp*.m
+exports/
+
+# 实验结果（通过 Syncthing 同步，不走 Git）
+results_*/
+results_matlab/
+results_synced/
+
+# 大型数据文件（通过 Git LFS 管理，见 .gitattributes）
+# *.mat  — 由 LFS 跟踪，不在此忽略
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Syncthing
+.stfolder
+.stversions
+.stignore
+
+# NSSM 服务
+nssm.exe
+
+# 审查报告（内部文档，不入库）
+CODE_REVIEW*.md
+
+# 环境变量（含敏感信息）
+# .env  — 注意：当前 .env 不含真实密钥，可入库作为模板
+# 如果添加了真实 token，取消下行注释：
+# .env
+.workbuddy/
