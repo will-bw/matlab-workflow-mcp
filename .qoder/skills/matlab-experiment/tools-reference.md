@@ -1,36 +1,27 @@
 # MATLAB MCP Server — Tool Reference
 
-Complete parameter reference for all 26 MCP tools.
+Complete parameter reference for all 21 MCP tools.
 
 ## Execution Tools
 
-### execute_code
+### run
 Run MATLAB code in the persistent session. Auto-captures new figures.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | code | str | (required) | MATLAB code (multi-line OK) |
-| timeout | int | 0 | Timeout seconds (0 = use EXEC_TIMEOUT=600) |
+| timeout | int | 0 | Timeout seconds (0 = default 600s, set 1800 for medium tasks) |
+| description | str | "" | Experiment description (for logging) |
+
+**Selection guide:**
+- Quick verification (< 10min): call directly, timeout default
+- Medium experiment (10-30min): set timeout=1800
+- Long experiment (> 30min): use submit_task instead
 
 ### run_script
 Run a .m script file.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | script_path | str | (required) | Absolute or relative path to .m file |
-
-### execute_section
-Run a specific section (%% delimited) of a script.
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| file_path | str | (required) | Path to .m file |
-| section | str | "0" | Index ("0","1"), title match, "all", or "list" |
-
-### run_and_wait
-Run code and block until done. For 5-30 min experiments.
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| code | str | (required) | MATLAB code |
-| timeout | int | 1800 | Max wait seconds (30 min) |
-| description | str | "" | Label for logging |
 
 ## Background Task Tools
 
@@ -65,22 +56,19 @@ List all background tasks and their statuses. No parameters.
 
 ## Workspace Tools
 
-### get_workspace
-List all workspace variables (like `whos`). No parameters.
-
-### get_variable
-Display a variable's value (truncated for large arrays).
+### inspect
+Unified workspace/variable inspection.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| var_name | str | (required) | Variable name, e.g. "result.cost", "Model{1}" |
+| var_name | str | "" | Variable name (empty = list workspace, non-empty = show variable) |
 | max_elements | int | 1000 | Max elements to display |
+| max_depth | int | 2 | Struct recursion depth (only for mode=structure) |
+| mode | str | "auto" | "auto" / "value" / "structure" |
 
-### get_struct_info
-Show struct/cell metadata (fields, types, sizes) without data.
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| var_name | str | (required) | Variable name |
-| max_depth | int | 2 | Recursion depth |
+**Usage examples:**
+- List all workspace variables: `inspect()`
+- Show variable value: `inspect(var_name="result")` or `inspect(var_name="Model{1}")`
+- Show struct tree: `inspect(var_name="result", mode="structure")`
 
 ### set_variable
 Set a workspace variable via MATLAB expression.
@@ -91,28 +79,32 @@ Set a workspace variable via MATLAB expression.
 
 ## Experiment Tools
 
-### run_experiment
-Run a packaged experiment (ablation or custom).
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| experiment_type | str | (required) | "ablation_chunk" or "custom" |
-| algo | str | "HeteroPSO-KR" | Algorithm name |
-| models | str | "1:56" | Model range |
-| n_runs | int | 1 | Number of runs |
-| output_base | str | "" | Output directory (auto if empty) |
-| extra_params | str | "" | Extra params: "n=10, maxevals=30000" |
+### experiment
+Run paper experiments (unified entry).
 
-### run_batch_experiment
-Run arbitrary MATLAB experiment configuration code.
+**Two modes:**
+1. Parameterized: specify algo/models/n_runs/seed → calls mcp_run_experiment.m
+2. Raw code: pass raw_code (full MATLAB experiment code) → executes directly
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| config_code | str | (required) | Full MATLAB experiment code |
-| description | str | "" | Description for logging |
+| algo | str | "HeteroPSO-KR" | Algorithm name |
+| models | str | "1:56" | Model range (e.g. "1:10", "[1,5,10]") |
+| n_runs | int | 1 | Runs per model |
+| output_base | str | "" | Output directory (auto-timestamped if empty) |
+| extra_params | str | "" | Extra params: "n=10, maxevals=30000, particles=1000" |
+| seed | int | 42 | Random seed for reproducibility |
+| raw_code | str | "" | Raw MATLAB code (overrides all other params) |
+
+**Selection guide:**
+- Standard paper experiment → parameterized mode
+- Custom/complex experiment → raw_code mode
+- Experiment > 30 min → use submit_task instead
 
 ## Figure & File Tools
 
 ### save_figure
-Export a MATLAB figure as image (returns base64).
+Export a MATLAB figure as image (returns base64). ⛔ 禁止使用——太慢。
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | figure_code | str | "" | Code to generate figure (empty = export current) |
@@ -121,6 +113,12 @@ Export a MATLAB figure as image (returns base64).
 | format | str | "png" | Format: png, jpg, svg, pdf |
 | dpi | int | 150 | Resolution |
 
+**⛔ 不要调用此工具。** 出图统一用：
+```
+run(code="exportgraphics(gcf, 'exports/fig.png', 'Resolution', 200)")
+```
+然后从 Mac 本地读取 `~/Desktop/codes/Paper2/exports/fig.png`（Syncthing 同步）。
+
 ### get_figure_info
 Get figure metadata (axes, labels, legends, line data).
 | Param | Type | Default | Description |
@@ -128,7 +126,7 @@ Get figure metadata (axes, labels, legends, line data).
 | fig_handle | str | "gcf" | Figure handle expression |
 
 ### transfer_file
-Download a file from Windows (returns base64).
+Download a file from Windows (returns base64). ⚠️ Only for small files.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | file_path | str | (required) | File path (absolute or relative) |
@@ -160,15 +158,18 @@ Run MATLAB checkcode static analysis.
 
 ## System Management
 
-### health_check
-One-shot diagnostic of all components. No parameters.
-Checks: MATLAB Engine, working dir, Syncthing, Tailscale, background tasks.
+### diagnose
+Unified diagnostic entry.
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| detail | str | "full" | "quick" (resources + queue only) / "full" (MATLAB + Syncthing + Tailscale) |
 
 ### sync_status
 Check Syncthing file sync status. No parameters.
 
-### get_status
-Get MATLAB session info (version, memory, uptime). No parameters.
+### force_restart_engine
+Force restart MATLAB Engine. ⚠️ Loses all workspace variables.
+Use when engine is stuck (e.g. timeout but MATLAB still running). No parameters.
 
 ### reset_session
 Clear MATLAB workspace.

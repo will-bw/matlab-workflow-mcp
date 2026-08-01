@@ -244,6 +244,24 @@ def check_task_queue_limits() -> tuple:
 
 # ============ 后台任务管理器 ============
 # 解决多小时实验的核心方案：提交后立即返回 task_id，不阻塞 SSE 连接
+
+class LiveOutput(io.StringIO):
+    """线程安全的实时输出缓冲区（P1-4: 后台任务运行期间即可读取已有输出）"""
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.last_write_time = None
+
+    def write(self, s):
+        with self._lock:
+            self.last_write_time = datetime.now()
+            return super().write(s)
+
+    def getvalue_safe(self) -> str:
+        with self._lock:
+            return self.getvalue()
+
+
 class BackgroundTask:
     """后台任务状态跟踪"""
     def __init__(self, task_id: str, description: str, code: str):
@@ -258,12 +276,17 @@ class BackgroundTask:
         self.error = ""
         self.progress_log = []  # 进度日志
         self._cancel_flag = False
+        # P1-4: 实时输出缓冲区
+        self.live_stdout = LiveOutput()
+        self.live_stderr = LiveOutput()
 
     @property
     def elapsed(self) -> str:
+        """实际执行耗时（不含排队等待）"""
+        if self.start_time is None:
+            return "等待中"
         end = self.end_time or datetime.now()
-        start = self.start_time or self.submit_time
-        delta = end - start
+        delta = end - self.start_time
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         if hours > 0:
@@ -272,11 +295,44 @@ class BackgroundTask:
             return f"{minutes}m {seconds}s"
         return f"{seconds}s"
 
+    @property
+    def wait_time(self) -> str:
+        """排队等待耗时"""
+        if self.start_time is None:
+            delta = datetime.now() - self.submit_time
+        else:
+            delta = self.start_time - self.submit_time
+        seconds = int(delta.total_seconds())
+        if seconds < 1:
+            return "<1s"
+        elif seconds < 60:
+            return f"{seconds}s"
+        else:
+            return f"{seconds // 60}m {seconds % 60}s"
+
+    @property
+    def last_activity(self) -> str:
+        """最后一次有输出的时间"""
+        t = self.live_stdout.last_write_time or self.live_stderr.last_write_time
+        if t is None:
+            return "无"
+        delta = datetime.now() - t
+        seconds = int(delta.total_seconds())
+        if seconds < 60:
+            return f"{seconds}s 前"
+        elif seconds < 3600:
+            return f"{seconds // 60}m 前"
+        else:
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m 前"
+
     def to_summary(self) -> str:
         status_icon = {"pending": "⏳", "running": "🔄", "completed": "✅", "failed": "❌", "cancelled": "⛔"}
         icon = status_icon.get(self.status, "?")
-        return (f"{icon} [{self.task_id}] {self.description}\n"
-                f"   状态: {self.status} | 耗时: {self.elapsed}")
+        summary = (f"{icon} [{self.task_id}] {self.description}\n"
+                   f"   状态: {self.status} | 耗时: {self.elapsed}")
+        if self.status == "running":
+            summary += f" | 最后活动: {self.last_activity}"
+        return summary
 
 
 _task_registry: dict = {}  # task_id -> BackgroundTask
@@ -287,12 +343,11 @@ _task_lock = threading.Lock()
 def _run_background_task(task: BackgroundTask):
     """在后台线程中执行长时间 MATLAB 任务"""
     global eng
-    task.status = "running"
-    task.start_time = datetime.now()
-    logger.info(f"后台任务开始: [{task.task_id}] {task.description}")
+    logger.info(f"后台任务启动中: [{task.task_id}] {task.description}")
 
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    # P1-4: 使用 LiveOutput 实现实时输出流
+    stdout = task.live_stdout
+    stderr = task.live_stderr
 
     try:
         # 检查是否在启动前已被取消
@@ -303,9 +358,27 @@ def _run_background_task(task: BackgroundTask):
             return
 
         engine = get_engine()
-        # 在 MATLAB 中设置进度回调（写入日志文件）
-        progress_file = os.path.join(MATLAB_WORKING_DIR, f"_task_{task.task_id}_progress.txt")
-        with _engine_lock:
+
+        # P0-3 修复: 获取引擎锁设置 60s 超时，超时则标记 failed
+        BG_LOCK_TIMEOUT = 60
+        acquired = _engine_lock.acquire(timeout=BG_LOCK_TIMEOUT)
+        if not acquired:
+            task.status = "failed"
+            task.error = (
+                f"引擎被其他任务占用超过 {BG_LOCK_TIMEOUT}s，无法启动。"
+                f"请等待当前任务完成后再提交。"
+            )
+            task.end_time = datetime.now()
+            logger.error(f"后台任务启动失败(引擎忙): [{task.task_id}]")
+            return
+
+        try:
+            # 标记任务真正开始执行（计时起点）
+            task.status = "running"
+            task.start_time = datetime.now()
+
+            # 在 MATLAB 中设置进度回调（写入日志文件）
+            progress_file = os.path.join(MATLAB_WORKING_DIR, f"_task_{task.task_id}_progress.txt")
             engine.eval(
                 f"fid = fopen('{progress_file}', 'w'); "
                 f"fprintf(fid, 'TASK_START %s\\n', datestr(now)); "
@@ -313,27 +386,28 @@ def _run_background_task(task: BackgroundTask):
                 nargout=0
             )
 
-        # 执行任务代码（无超时限制）
-        with _engine_lock:
+            # 执行任务代码（无超时限制）
             engine.eval(task.code, nargout=0, stdout=stdout, stderr=stderr)
+        finally:
+            _engine_lock.release()
 
         # 执行完成后检查是否在执行期间被标记取消
         if task._cancel_flag:
-            task.output = stdout.getvalue()
+            task.output = stdout.getvalue_safe()
             task.error = "任务在执行完成后被标记为取消（结果可能不完整）"
             task.status = "cancelled"
             logger.info(f"后台任务完成但已被标记取消: [{task.task_id}]")
         else:
-            task.output = stdout.getvalue()
-            task.error = stderr.getvalue()
+            task.output = stdout.getvalue_safe()
+            task.error = stderr.getvalue_safe()
             task.status = "completed"
             logger.info(f"后台任务完成: [{task.task_id}] 耗时 {task.elapsed}")
 
     except matlab.engine.MatlabExecutionError as e:
-        task.error = f"{e.message}\n{stderr.getvalue()}"
-        task.output = stdout.getvalue()
+        task.error = f"{_matlab_error_msg(e)}\n{stderr.getvalue_safe()}"
+        task.output = stdout.getvalue_safe()
         task.status = "cancelled" if task._cancel_flag else "failed"
-        logger.error(f"后台任务失败: [{task.task_id}] {e.message}")
+        logger.error(f"后台任务失败: [{task.task_id}] {_matlab_error_msg(e)}")
     except Exception as e:
         task.error = str(e)
         task.status = "cancelled" if task._cancel_flag else "failed"
@@ -376,10 +450,21 @@ def matlab_eval(code, nargout=0, stdout=None, stderr=None):
     线程安全的 MATLAB eval 入口。
     所有前台工具的 engine.eval 调用必须通过此函数，
     以防止与后台任务的并发调用冲突（MATLAB Engine 不支持并发）。
+
+    P0-2 修复: 带超时获取锁，引擎被后台任务占用时抛出 EngineBusyError，
+    而非无限阻塞导致 MCP 传输层超时崩溃。
     """
     engine = get_engine()
-    with _engine_lock:
+    acquired = _engine_lock.acquire(timeout=FG_LOCK_TIMEOUT)
+    if not acquired:
+        raise EngineBusyError(
+            f"MATLAB 引擎正被后台任务占用（等待 {FG_LOCK_TIMEOUT}s 超时）。"
+            f"请使用 get_task_status() 监控后台任务，或等待其完成后再执行前台命令。"
+        )
+    try:
         return engine.eval(code, nargout=nargout, stdout=stdout, stderr=stderr)
+    finally:
+        _engine_lock.release()
 
 
 def run_matlab_sync(func, timeout: int = None):
@@ -415,6 +500,55 @@ def format_output(stdout_val: str, stderr_val: str = "") -> str:
     return truncate_output(result)
 
 
+# ============ P0 修复: 错误处理辅助 ============
+
+class EngineBusyError(Exception):
+    """引擎被后台任务占用时抛出，前台工具应捕获并返回友好提示"""
+    pass
+
+
+def _matlab_error_msg(e) -> str:
+    """安全提取 MATLAB 异常信息（兼容不同版本 Engine API）"""
+    # MatlabExecutionError 的 args[0] 通常是完整错误文本
+    msg = getattr(e, 'message', None) or (e.args[0] if e.args else str(e))
+    return str(msg)
+
+
+def _error_response(error_type: str, message: str, elapsed: float = 0, hint: str = "") -> str:
+    """结构化错误返回，客户端可根据 error_type 决定下一步操作"""
+    # error_type: TIMEOUT | MATLAB_ERROR | ENGINE_BUSY | ENGINE_CRASH | PYTHON_ERROR
+    result = f"[{error_type}] {message}"
+    if elapsed > 0:
+        result += f"\n耗时: {elapsed:.1f}s"
+    if hint:
+        result += f"\n建议: {hint}"
+    return result
+
+
+# 前台工具获取引擎锁的默认超时（秒）
+FG_LOCK_TIMEOUT = int(os.environ.get("FG_LOCK_TIMEOUT", "15"))
+
+# ============ P2-9: 执行历史审计日志 ============
+import collections
+
+_execution_history = collections.deque(maxlen=100)  # 环形缓冲区，最近 100 条
+_history_lock = threading.Lock()
+
+
+def _record_execution(tool: str, code_summary: str, elapsed: float, success: bool, error: str = ""):
+    """记录每次执行到历史缓冲区"""
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "tool": tool,
+        "code": code_summary[:200],
+        "elapsed_s": round(elapsed, 1),
+        "success": success,
+        "error": error[:100] if error else "",
+    }
+    with _history_lock:
+        _execution_history.append(entry)
+
+
 # ============ 核心工具 ============
 
 @mcp.tool()
@@ -446,8 +580,14 @@ async def run(code: str, timeout: int = 0, description: str = "") -> str:
     def _exec():
         stdout = io.StringIO()
         stderr = io.StringIO()
-        # 整个执行序列加锁，防止与后台任务并发
-        with _engine_lock:
+        # P0-2 修复: 带超时获取锁，避免无限阻塞导致 MCP 传输层崩溃
+        acquired = _engine_lock.acquire(timeout=FG_LOCK_TIMEOUT)
+        if not acquired:
+            raise EngineBusyError(
+                f"MATLAB 引擎正被后台任务占用（等待 {FG_LOCK_TIMEOUT}s 超时）。"
+                f"请使用 get_task_status() 监控后台任务，或等待其完成后再执行前台命令。"
+            )
+        try:
             # 记录执行前的图形列表（MATLAB 变量名不能以下划线开头）
             if AUTO_CAPTURE_FIGURES:
                 engine.eval("mcpFigsBefore = findall(0, 'Type', 'figure');", nargout=0)
@@ -464,28 +604,49 @@ async def run(code: str, timeout: int = 0, description: str = "") -> str:
                     "clear mcpFigsBefore mcpFigsAfter mcpNewFigs;",
                     nargout=0, stdout=stdout, stderr=stderr
                 )
+        finally:
+            _engine_lock.release()
         return stdout.getvalue(), stderr.getvalue()
 
     try:
         loop = asyncio.get_running_loop()
-        out, err = await asyncio.wait_for(
-            loop.run_in_executor(_executor, _exec),
-            timeout=t
-        )
-    except asyncio.TimeoutError:
-        elapsed = (datetime.now() - start_time).total_seconds()
-        return (
-            f"[超时] 执行超过 {t} 秒被终止（已耗时 {elapsed:.0f}s）。\n"
-            f"建议: 对于更长时间的实验，请使用 submit_task 提交后台任务。"
-        )
+        future = loop.run_in_executor(_executor, _exec)
+        # P1-6: 心跳保活——每 30s 轮询一次，保持事件循环活跃，防止 SSE 传输层超时断开
+        HEARTBEAT_INTERVAL = 30
+        while not future.done():
+            try:
+                out, err = await asyncio.wait_for(asyncio.shield(future), timeout=HEARTBEAT_INTERVAL)
+                break  # 执行完成
+            except asyncio.TimeoutError:
+                elapsed_so_far = (datetime.now() - start_time).total_seconds()
+                if elapsed_so_far > t:
+                    # 超过用户设置的超时，取消执行
+                    future.cancel()
+                    return _error_response(
+                        "TIMEOUT",
+                        f"执行超过 {t} 秒被终止（已耗时 {elapsed_so_far:.0f}s）。",
+                        elapsed=elapsed_so_far,
+                        hint="对于更长时间的实验，请使用 submit_task 提交后台任务。"
+                    )
+                # 心跳日志，保持事件循环活跃
+                logger.info(f"run heartbeat: {elapsed_so_far:.0f}s elapsed (timeout={t}s)")
+        else:
+            # future 已完成（循环未 break）
+            out, err = future.result()
+    except EngineBusyError as e:
+        _record_execution("run", code, (datetime.now() - start_time).total_seconds(), False, "ENGINE_BUSY")
+        return _error_response("ENGINE_BUSY", str(e))
     except matlab.engine.MatlabExecutionError as e:
         elapsed = (datetime.now() - start_time).total_seconds()
-        return f"[MATLAB 错误] 耗时 {elapsed:.1f}s\n{e.message}"
+        _record_execution("run", code, elapsed, False, _matlab_error_msg(e))
+        return _error_response("MATLAB_ERROR", _matlab_error_msg(e), elapsed=elapsed)
     except Exception as e:
-        return f"[Python 错误]\n{str(e)}\n{traceback.format_exc()}"
+        _record_execution("run", code, (datetime.now() - start_time).total_seconds(), False, str(e))
+        return _error_response("PYTHON_ERROR", f"{str(e)}\n{traceback.format_exc()}")
 
     # 耗时统计
     elapsed = (datetime.now() - start_time).total_seconds()
+    _record_execution("run", code, elapsed, True)
     if elapsed > 3600:
         time_str = f"{elapsed/3600:.1f} 小时"
     elif elapsed > 60:
@@ -532,8 +693,14 @@ def run_script(script_path: str, section: str = "") -> str:
     # 整脚本模式
     script_name = os.path.splitext(os.path.basename(script_path))[0]
     try:
-        with _engine_lock:
-            engine = get_engine()
+        engine = get_engine()
+        # P0-2 修复: 带超时获取锁
+        acquired = _engine_lock.acquire(timeout=FG_LOCK_TIMEOUT)
+        if not acquired:
+            return _error_response("ENGINE_BUSY",
+                f"MATLAB 引擎正被后台任务占用（等待 {FG_LOCK_TIMEOUT}s 超时）。",
+                hint="请等待后台任务完成后再执行前台命令。")
+        try:
             original_dir = None
             if os.path.isabs(script_path):
                 script_dir = os.path.dirname(script_path)
@@ -544,8 +711,10 @@ def run_script(script_path: str, section: str = "") -> str:
 
             if original_dir:
                 engine.cd(original_dir, nargout=0)
+        finally:
+            _engine_lock.release()
     except matlab.engine.MatlabExecutionError as e:
-        return f"[MATLAB 错误]\n{e.message}\n\n[stderr]\n{stderr.getvalue()}"
+        return f"[MATLAB 错误]\n{_matlab_error_msg(e)}\n\n[stderr]\n{stderr.getvalue()}"
     except Exception as e:
         return f"[Python 错误]\n{str(e)}\n{traceback.format_exc()}"
 
@@ -589,7 +758,7 @@ def _run_section(file_path: str, section: str, stdout: io.StringIO, stderr: io.S
         try:
             matlab_eval(f"run('{file_path}')", nargout=0, stdout=stdout, stderr=stderr)
         except matlab.engine.MatlabExecutionError as e:
-            return f"[MATLAB 错误] {e.message}"
+            return f"[MATLAB 错误] {_matlab_error_msg(e)}"
         return format_output(stdout.getvalue(), stderr.getvalue())
 
     target_idx = -1
@@ -611,7 +780,7 @@ def _run_section(file_path: str, section: str, stdout: io.StringIO, stderr: io.S
     try:
         matlab_eval(code, nargout=0, stdout=stdout, stderr=stderr)
     except matlab.engine.MatlabExecutionError as e:
-        return f"[MATLAB 错误] 段落 [{target_idx}] '{title}'\n{e.message}"
+        return f"[MATLAB 错误] 段落 [{target_idx}] '{title}'\n{_matlab_error_msg(e)}"
     except Exception as e:
         return f"[Python 错误] {str(e)}"
 
@@ -660,7 +829,7 @@ def inspect(var_name: str = "", max_elements: int = 1000, max_depth: int = 2, mo
             nargout=0, stdout=stdout, stderr=stderr
         )
     except matlab.engine.MatlabExecutionError as e:
-        return f"[错误] 变量 '{var_name}' 不存在: {e.message}"
+        return f"[错误] 变量 '{var_name}' 不存在: {_matlab_error_msg(e)}"
     except Exception as e:
         return f"[Python 错误] {str(e)}"
 
@@ -724,7 +893,7 @@ def inspect(var_name: str = "", max_elements: int = 1000, max_depth: int = 2, mo
                 nargout=0, stdout=stdout, stderr=stderr
             )
         except matlab.engine.MatlabExecutionError as e:
-            return f"[错误] 变量 '{var_name}' 无法解析: {e.message}"
+            return f"[错误] 变量 '{var_name}' 无法解析: {_matlab_error_msg(e)}"
         except Exception as e:
             return f"[Python 错误] {str(e)}"
         return truncate_output(stdout.getvalue()) or "[无输出]"
@@ -747,7 +916,7 @@ def inspect(var_name: str = "", max_elements: int = 1000, max_depth: int = 2, mo
                 nargout=0, stdout=stdout2, stderr=stderr
             )
         except matlab.engine.MatlabExecutionError as e:
-            return f"[错误] 变量 '{var_name}' 无法显示: {e.message}"
+            return f"[错误] 变量 '{var_name}' 无法显示: {_matlab_error_msg(e)}"
         except Exception as e:
             return f"[Python 错误] {str(e)}"
         return truncate_output(stdout2.getvalue())
@@ -773,7 +942,7 @@ def set_variable(var_name: str, value: str) -> str:
         # 验证设置成功
         matlab_eval(f"disp({var_name})", nargout=0, stdout=stdout, stderr=stderr)
     except matlab.engine.MatlabExecutionError as e:
-        return f"[错误] 设置变量失败: {e.message}"
+        return f"[错误] 设置变量失败: {_matlab_error_msg(e)}"
     except Exception as e:
         return f"[Python 错误] {str(e)}"
 
@@ -828,7 +997,7 @@ def experiment(
             matlab_eval("addpath(fullfile(pwd, 'utils'));", nargout=0)
             matlab_eval(raw_code, nargout=0, stdout=stdout, stderr=stderr)
         except matlab.engine.MatlabExecutionError as e:
-            return f"[MATLAB 错误]\n{e.message}\n\n[stderr]\n{stderr.getvalue()}"
+            return f"[MATLAB 错误]\n{_matlab_error_msg(e)}\n\n[stderr]\n{stderr.getvalue()}"
         except Exception as e:
             return f"[Python 错误]\n{str(e)}\n{traceback.format_exc()}"
         return format_output(stdout.getvalue(), stderr.getvalue())
@@ -866,7 +1035,7 @@ def experiment(
     try:
         matlab_eval(run_code, nargout=0, stdout=stdout, stderr=stderr)
     except matlab.engine.MatlabExecutionError as e:
-        return f"[MATLAB 错误]\n{e.message}\n\n[stderr]\n{stderr.getvalue()}"
+        return f"[MATLAB 错误]\n{_matlab_error_msg(e)}\n\n[stderr]\n{stderr.getvalue()}"
     except Exception as e:
         return f"[Python 错误]\n{str(e)}\n{traceback.format_exc()}"
 
@@ -943,6 +1112,7 @@ def submit_task(code: str, description: str = "", force: bool = False) -> str:
         name=f"matlab-task-{task_id}"
     )
     thread.start()
+    _record_execution("submit_task", code, 0, True)
 
     # 构建响应（包含当前负载摘要）
     pending_count = sum(1 for t in _task_registry.values() if t.status == "pending")
@@ -1007,13 +1177,17 @@ def get_task_status(task_id: str = "") -> str:
 
     # 结构化 JSON 供 AI 客户端可靠解析
     import json as _json
+    # P1-4/P1-5: 增加实时输出状态和等待时间
+    live_out = task.live_stdout.getvalue_safe() if task.status == "running" else task.output
     json_block = _json.dumps({
         "task_id": task.task_id,
         "status": task.status,
         "description": task.description,
         "elapsed": task.elapsed,
-        "has_output": bool(task.output),
+        "wait_time": task.wait_time,
+        "has_output": bool(live_out),
         "has_error": bool(task.error),
+        "last_activity": task.last_activity if task.status == "running" else None,
     }, ensure_ascii=False)
     result += f"\n---JSON---\n{json_block}"
 
@@ -1038,14 +1212,15 @@ def get_task_output(task_id: str, tail_lines: int = 100) -> str:
         return f"[错误] 任务 '{task_id}' 不存在"
 
     if task.status == "running":
-        # 运行中返回增量输出（而非拒绝）
+        # P1-4: 运行中从 LiveOutput 实时读取输出
+        live_out = task.live_stdout.getvalue_safe()
         result = (
-            f"[任务仍在运行中] 耗时: {task.elapsed}\n"
+            f"[任务仍在运行中] 耗时: {task.elapsed} | 等待: {task.wait_time} | 最后活动: {task.last_activity}\n"
         )
-        if task.output:
-            lines = task.output.strip().split("\n")
-            tail = "\n".join(lines[-tail_lines:]) if tail_lines > 0 else task.output
-            result += f"[当前输出 (最后 {min(tail_lines, len(lines))} 行)]\n{tail}\n"
+        if live_out:
+            lines = live_out.strip().split("\n")
+            tail = "\n".join(lines[-tail_lines:]) if tail_lines > 0 else live_out
+            result += f"[实时输出 (最后 {min(tail_lines, len(lines))} 行，共 {len(lines)} 行)]\n{tail}\n"
         else:
             result += "尚无输出。\n"
         result += f"使用 get_task_status('{task_id}') 查看状态。"
@@ -1118,6 +1293,42 @@ def list_tasks() -> str:
     return result
 
 
+@mcp.tool()
+def get_history(n: int = 20) -> str:
+    """
+    查看最近的执行历史记录（审计日志）。
+    记录所有 run / submit_task 调用的代码摘要、耗时和成功/失败状态。
+
+    Args:
+        n: 显示最近 N 条记录（默认 20，最大 100）
+
+    Returns:
+        执行历史列表（时间、工具、代码摘要、耗时、状态）
+    """
+    with _history_lock:
+        records = list(_execution_history)
+
+    if not records:
+        return "[无执行历史] 尚无 run/submit_task 调用记录。"
+
+    n = min(n, len(records))
+    recent = records[-n:]  # 最近 n 条
+    recent.reverse()  # 最新的在前
+
+    result = f"[执行历史] 最近 {n} 条（共 {len(records)} 条）\n\n"
+    for i, r in enumerate(recent, 1):
+        status_icon = "✓" if r["success"] else "✗"
+        code_preview = r["code"].replace("\n", " ")[:60]
+        elapsed_str = f"{r['elapsed_s']}s" if r["elapsed_s"] > 0 else "-"
+        result += f"  {i:2d}. {status_icon} [{r['time']}] {r['tool']} | {elapsed_str}\n"
+        result += f"      {code_preview}"
+        if r["error"]:
+            result += f"\n      错误: {r['error']}"
+        result += "\n"
+
+    return result
+
+
 # ============ 文件与图形工具 ============
 
 @mcp.tool()
@@ -1173,7 +1384,7 @@ def save_figure(
             return f"[错误] 文件未生成: {full_path}\n{stdout.getvalue()}"
 
     except matlab.engine.MatlabExecutionError as e:
-        return f"[MATLAB 错误]\n{e.message}\n\n[stderr]\n{stderr.getvalue()}"
+        return f"[MATLAB 错误]\n{_matlab_error_msg(e)}\n\n[stderr]\n{stderr.getvalue()}"
     except Exception as e:
         return f"[Python 错误]\n{str(e)}\n{traceback.format_exc()}"
 
@@ -1349,7 +1560,7 @@ def lint_code(code: str = "", file_path: str = "", severity: str = "all") -> str
         )
 
     except matlab.engine.MatlabExecutionError as e:
-        return f"[MATLAB 错误] {e.message}"
+        return f"[MATLAB 错误] {_matlab_error_msg(e)}"
     except Exception as e:
         return f"[错误] {str(e)}"
     finally:
@@ -1419,7 +1630,7 @@ def get_figure_info(fig_handle: str = "gcf") -> str:
             nargout=0, stdout=stdout, stderr=stderr
         )
     except matlab.engine.MatlabExecutionError as e:
-        return f"[错误] 无法获取图形信息: {e.message}"
+        return f"[错误] 无法获取图形信息: {_matlab_error_msg(e)}"
     except Exception as e:
         return f"[Python 错误] {str(e)}"
 
@@ -1586,11 +1797,17 @@ def diagnose(detail: str = "full") -> str:
         # MATLAB Engine
         try:
             engine = get_engine()
-            with _engine_lock:
-                ver = engine.version()
-                cwd = engine.pwd()
-            lines.append(f"  ✓ MATLAB Engine: {ver}")
-            lines.append(f"    工作目录: {cwd}")
+            acquired = _engine_lock.acquire(timeout=FG_LOCK_TIMEOUT)
+            if acquired:
+                try:
+                    ver = engine.version()
+                    cwd = engine.pwd()
+                finally:
+                    _engine_lock.release()
+                lines.append(f"  ✓ MATLAB Engine: {ver}")
+                lines.append(f"    工作目录: {cwd}")
+            else:
+                lines.append(f"  ⚠ MATLAB Engine: 引擎忙（后台任务占用中）")
         except Exception as e:
             lines.append(f"  ✗ MATLAB Engine: {str(e)[:100]}")
             all_ok = False
@@ -1799,13 +2016,20 @@ def change_directory(path: str) -> str:
     stderr = io.StringIO()
 
     try:
-        with _engine_lock:
-            engine = get_engine()
+        engine = get_engine()
+        acquired = _engine_lock.acquire(timeout=FG_LOCK_TIMEOUT)
+        if not acquired:
+            return _error_response("ENGINE_BUSY",
+                f"MATLAB 引擎正被后台任务占用（等待 {FG_LOCK_TIMEOUT}s 超时）。",
+                hint="请等待后台任务完成后再执行前台命令。")
+        try:
             engine.cd(path, nargout=0, stdout=stdout, stderr=stderr)
             current = engine.pwd()
+        finally:
+            _engine_lock.release()
         return f"[成功] 工作目录已切换为: {current}"
     except matlab.engine.MatlabExecutionError as e:
-        return f"[错误] 无法切换目录: {e.message}"
+        return f"[错误] 无法切换目录: {_matlab_error_msg(e)}"
     except Exception as e:
         return f"[Python 错误] {str(e)}"
 
@@ -1844,15 +2068,30 @@ if __name__ == "__main__":
             logger.error("提示: 使用 --no-preload 跳过预启动，在首次调用时再启动")
             sys.exit(1)
 
-    # 启动 SSE 服务（带 Bearer Token 认证中间件）
+    # 启动 SSE 服务（带 Bearer Token 认证中间件 + /health 端点）
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, Mount
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    # P2-8: 健康检查端点（无需认证，供客户端探活）
+    async def health_check(request: Request):
+        running = sum(1 for t in _task_registry.values() if t.status == "running")
+        pending = sum(1 for t in _task_registry.values() if t.status == "pending")
+        uptime = (datetime.now() - _session_start_time).total_seconds() if _session_start_time else 0
+        return JSONResponse({
+            "status": "ok" if eng is not None else "no_engine",
+            "engine_busy": _engine_lock.locked(),
+            "tasks_running": running,
+            "tasks_pending": pending,
+            "uptime_seconds": round(uptime),
+            "version": "2.0",
+        })
+
     if MCP_TOKEN:
         # 使用自定义 ASGI 中间件实现真正的 Token 校验
-        import uvicorn
-        from starlette.applications import Starlette
-        from starlette.middleware import Middleware
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse
-        from starlette.types import ASGIApp, Receive, Scope, Send
 
         class BearerTokenMiddleware:
             """ASGI 中间件：校验 Authorization: Bearer <token> 头或 ?token= query param"""
@@ -1862,8 +2101,13 @@ if __name__ == "__main__":
 
             async def __call__(self, scope: Scope, receive: Receive, send: Send):
                 if scope["type"] == "http":
+                    # /health 端点无需认证
+                    path = scope.get("path", "")
+                    if path == "/health":
+                        await self.app(scope, receive, send)
+                        return
+
                     # P0-B 修复: 同时支持 header 和 query parameter 认证
-                    # 因为多数 MCP 客户端的 SSE 配置不支持自定义 headers
                     authenticated = False
 
                     # 方式 1: Authorization: Bearer <token> header
@@ -1889,9 +2133,21 @@ if __name__ == "__main__":
                         return
                 await self.app(scope, receive, send)
 
-        # 获取 FastMCP 的 SSE app 并包装认证中间件
+        # 获取 FastMCP 的 SSE app 并包装认证中间件 + health 路由
         sse_app = mcp.sse_app()
         authenticated_app = BearerTokenMiddleware(sse_app, MCP_TOKEN)
-        uvicorn.run(authenticated_app, host=HOST, port=PORT, log_level="warning")
+
+        # 组合路由: /health + SSE app
+        app = Starlette(routes=[
+            Route("/health", health_check),
+            Mount("/", app=authenticated_app),
+        ])
+        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
     else:
-        mcp.run(transport="sse")
+        # 无认证模式: 仍然提供 /health 端点
+        sse_app = mcp.sse_app()
+        app = Starlette(routes=[
+            Route("/health", health_check),
+            Mount("/", app=sse_app),
+        ])
+        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
