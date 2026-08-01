@@ -1,11 +1,15 @@
 # MATLAB MCP Server — Tool Reference
 
-Complete parameter reference for all 21 MCP tools.
+Complete parameter reference for all 22 MCP tools.
+
+Transport: Streamable HTTP (default, endpoint `/mcp`) | SSE (legacy, endpoint `/sse`)
 
 ## Execution Tools
 
 ### run
 Run MATLAB code in the persistent session. Auto-captures new figures.
+Heartbeat every 30s keeps connection alive during long execution.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | code | str | (required) | MATLAB code (multi-line OK) |
@@ -17,36 +21,64 @@ Run MATLAB code in the persistent session. Auto-captures new figures.
 - Medium experiment (10-30min): set timeout=1800
 - Long experiment (> 30min): use submit_task instead
 
+**Error responses:**
+- `[ENGINE_BUSY]` — 引擎被后台任务占用（等 15s 超时），等待或取消后台任务
+- `[TIMEOUT]` — 超过 timeout 秒，改用 submit_task
+- `[MATLAB_ERROR]` — MATLAB 运行时错误，附带详细错误信息
+
 ### run_script
-Run a .m script file.
+Run a .m script file, or execute a specific section.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | script_path | str | (required) | Absolute or relative path to .m file |
+| section | str | "" | Section: "" = run all, "1" = by index, "Title" = by match, "list" = list sections |
 
 ## Background Task Tools
 
 ### submit_task
 Submit a long-running task. Returns immediately with task_id.
+Pre-submission checks: system resources + queue capacity.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | code | str | (required) | MATLAB code to run in background |
 | description | str | "" | Task description |
+| force | bool | False | Skip resource checks (emergency only) |
+
+**Behavior:**
+- 引擎被占用超过 60s → 任务自动标记 `failed`（不会静默卡死）
+- 运行期间 stdout 实时可读（LiveOutput）
 
 ### get_task_status
-Check task progress. Does NOT block.
+Check task progress. Does NOT block. Does NOT occupy engine.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | task_id | str | "" | Task ID (e.g. "T0001"). Empty = list all |
 
+**Returns:**
+- status: pending / running / completed / failed / cancelled
+- elapsed: 实际执行耗时（不含排队）
+- wait_time: 排队等待耗时
+- last_activity: 最后一次有输出的时间（running 时显示）
+- JSON block for programmatic parsing
+
 ### get_task_output
-Get completed task output.
+Get task output. **Running tasks show real-time output (LiveOutput).**
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | task_id | str | (required) | Task ID |
 | tail_lines | int | 100 | Show last N lines (0 = all) |
 
+**Behavior change (v2.0):**
+- 运行中: 返回已有输出 + 耗时 + 最后活动时间
+- 完成后: 返回完整输出
+
 ### cancel_task
-Cancel a running task.
+Cancel a running task. Note: if MATLAB eval is in progress, cancellation takes effect after current eval completes.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | task_id | str | (required) | Task ID to cancel |
@@ -54,10 +86,20 @@ Cancel a running task.
 ### list_tasks
 List all background tasks and their statuses. No parameters.
 
+### get_history (NEW)
+View recent execution history (audit log). Records all run/submit_task calls.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| n | int | 20 | Show last N records (max 100) |
+
+**Returns:** time, tool, code summary, elapsed, success/failure for each entry.
+
 ## Workspace Tools
 
 ### inspect
 Unified workspace/variable inspection.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | var_name | str | "" | Variable name (empty = list workspace, non-empty = show variable) |
@@ -72,6 +114,7 @@ Unified workspace/variable inspection.
 
 ### set_variable
 Set a workspace variable via MATLAB expression.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | var_name | str | (required) | Variable name |
@@ -105,6 +148,7 @@ Run paper experiments (unified entry).
 
 ### save_figure
 Export a MATLAB figure as image (returns base64). ⛔ 禁止使用——太慢。
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | figure_code | str | "" | Code to generate figure (empty = export current) |
@@ -121,12 +165,14 @@ run(code="exportgraphics(gcf, 'exports/fig.png', 'Resolution', 200)")
 
 ### get_figure_info
 Get figure metadata (axes, labels, legends, line data).
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | fig_handle | str | "gcf" | Figure handle expression |
 
 ### transfer_file
-Download a file from Windows (returns base64). ⚠️ Only for small files.
+Download a file from Windows (returns base64). ⚠️ Only for small files (< 50MB).
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | file_path | str | (required) | File path (absolute or relative) |
@@ -134,6 +180,7 @@ Download a file from Windows (returns base64). ⚠️ Only for small files.
 
 ### upload_file
 Upload a file to Windows.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | file_path | str | (required) | Target path on Windows |
@@ -141,6 +188,7 @@ Upload a file to Windows.
 
 ### list_files
 List files in a remote directory.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | directory | str | "." | Directory path |
@@ -150,6 +198,7 @@ List files in a remote directory.
 
 ### lint_code
 Run MATLAB checkcode static analysis.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | code | str | "" | Code to check (or use file_path) |
@@ -159,10 +208,13 @@ Run MATLAB checkcode static analysis.
 ## System Management
 
 ### diagnose
-Unified diagnostic entry.
+Unified diagnostic entry. Shows resources, task queue, engine status.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | detail | str | "full" | "quick" (resources + queue only) / "full" (MATLAB + Syncthing + Tailscale) |
+
+**v2.0 behavior:** Engine 忙时显示 "引擎忙（后台任务占用中）" 而非阻塞。
 
 ### sync_status
 Check Syncthing file sync status. No parameters.
@@ -173,12 +225,29 @@ Use when engine is stuck (e.g. timeout but MATLAB still running). No parameters.
 
 ### reset_session
 Clear MATLAB workspace.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | clear_all | bool | False | Also close figures and clear history |
 
 ### change_directory
 Change MATLAB working directory.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | path | str | (required) | Target directory path |
+
+## Health Endpoint (HTTP, not MCP tool)
+
+`GET /health` — 无需认证，供外部监控探活：
+```json
+{
+  "status": "ok",
+  "engine_busy": false,
+  "tasks_running": 0,
+  "tasks_pending": 0,
+  "uptime_seconds": 3600,
+  "transport": "streamable-http",
+  "version": "2.0"
+}
+```
