@@ -4,7 +4,12 @@ MATLAB MCP Server - 远程 MATLAB 执行服务
 基于 Python MCP SDK (FastMCP) + MATLAB Engine API for Python
 为 Paper2 (UAV 动态 4D 路径规划) 项目定制的远程实验执行服务。
 
-工具选择决策树 (21 个工具):
+传输协议:
+  - Streamable HTTP (默认, MCP 规范 2025-03-26): 单端点 /mcp，支持断线重连、动态流式升级
+  - SSE (向后兼容): 双端点 /sse + /messages，旧版客户端使用
+  - 客户端配置无需修改，Qoder 会自动探测并使用了 Streamable HTTP
+
+工具选择决策树 (22 个工具):
   用户想做什么 → 选哪个工具:
   - 快速验证/执行代码 (< 10分钟)  → run
   - 中等实验 (10-30分钟)          → run(timeout=1800)
@@ -19,10 +24,10 @@ MATLAB MCP Server - 远程 MATLAB 执行服务
   - 导出图形                      → save_figure
   - 检查代码质量                  → lint_code
   - 文件传输                      → transfer_file / upload_file
+  - 查看执行历史                  → get_history
 
-传输: SSE (Server-Sent Events)，支持局域网和 Tailscale 公网连接
-兼容: MATLAB R2022b + Python 3.8-3.10
-参考: neuromechanist/matlab-mcp-tools, jigarbhoye04/MatlabMCP, Tsuchijo/matlab-mcp
+兼容: MATLAB R2022b + Python 3.9-3.10 + MCP SDK >= 1.10.0
+参考: neuromechanist/matlab-mcp-tools, jigarbhoye04/MatlabMCP, matlab/matlab-mcp-server (官方)
 """
 
 import os
@@ -2044,15 +2049,30 @@ if __name__ == "__main__":
     )
     parser.add_argument("--workdir", default=None, help="MATLAB 工作目录 (覆盖环境变量)")
     parser.add_argument("--no-preload", action="store_true", help="不预启动 MATLAB Engine")
+    parser.add_argument(
+        "--transport", choices=["streamable-http", "sse"], default="streamable-http",
+        help="传输协议: streamable-http (默认, MCP 2025-03-26 规范) 或 sse (向后兼容旧客户端)"
+    )
     args = parser.parse_args()
 
     # 应用命令行参数（workdir 可覆盖）
     if args.workdir:
         MATLAB_WORKING_DIR = args.workdir
 
+    # 传输协议也可通过环境变量覆盖
+    TRANSPORT = os.environ.get("MCP_TRANSPORT", args.transport)
+
+    # 确定端点路径
+    if TRANSPORT == "streamable-http":
+        endpoint_path = "/mcp"
+    else:
+        endpoint_path = "/sse"
+
     logger.info("=" * 60)
     logger.info("MATLAB MCP Server 启动")
-    logger.info(f"  监听地址: http://{HOST}:{PORT}/sse")
+    logger.info(f"  传输协议: {TRANSPORT}")
+    logger.info(f"  监听地址: http://{HOST}:{PORT}{endpoint_path}")
+    logger.info(f"  健康检查: http://{HOST}:{PORT}/health")
     logger.info(f"  工作目录: {MATLAB_WORKING_DIR}")
     logger.info(f"  最大输出: {MAX_OUTPUT_LENGTH} 字符")
     logger.info(f"  认证: {'Bearer Token 已启用' if MCP_TOKEN else '未启用 (警告: 任何可达设备可执行代码)'}")
@@ -2068,7 +2088,7 @@ if __name__ == "__main__":
             logger.error("提示: 使用 --no-preload 跳过预启动，在首次调用时再启动")
             sys.exit(1)
 
-    # 启动 SSE 服务（带 Bearer Token 认证中间件 + /health 端点）
+    # ============ 启动服务 ============
     import uvicorn
     from starlette.applications import Starlette
     from starlette.requests import Request
@@ -2087,67 +2107,75 @@ if __name__ == "__main__":
             "tasks_running": running,
             "tasks_pending": pending,
             "uptime_seconds": round(uptime),
+            "transport": TRANSPORT,
             "version": "2.0",
         })
 
-    if MCP_TOKEN:
-        # 使用自定义 ASGI 中间件实现真正的 Token 校验
+    # Bearer Token 认证中间件
+    class BearerTokenMiddleware:
+        """ASGI 中间件：校验 Authorization: Bearer <token> 头或 ?token= query param"""
+        def __init__(self, app: ASGIApp, token: str):
+            self.app = app
+            self.token = token
 
-        class BearerTokenMiddleware:
-            """ASGI 中间件：校验 Authorization: Bearer <token> 头或 ?token= query param"""
-            def __init__(self, app: ASGIApp, token: str):
-                self.app = app
-                self.token = token
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                # /health 端点无需认证
+                path = scope.get("path", "")
+                if path == "/health":
+                    await self.app(scope, receive, send)
+                    return
 
-            async def __call__(self, scope: Scope, receive: Receive, send: Send):
-                if scope["type"] == "http":
-                    # /health 端点无需认证
-                    path = scope.get("path", "")
-                    if path == "/health":
-                        await self.app(scope, receive, send)
-                        return
+                authenticated = False
 
-                    # P0-B 修复: 同时支持 header 和 query parameter 认证
-                    authenticated = False
+                # 方式 1: Authorization: Bearer <token> header
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+                if auth_header.startswith("Bearer ") and auth_header[7:] == self.token:
+                    authenticated = True
 
-                    # 方式 1: Authorization: Bearer <token> header
-                    headers = dict(scope.get("headers", []))
-                    auth_header = headers.get(b"authorization", b"").decode()
-                    if auth_header.startswith("Bearer ") and auth_header[7:] == self.token:
+                # 方式 2: ?token=<token> query parameter
+                if not authenticated:
+                    from urllib.parse import parse_qs
+                    query_string = scope.get("query_string", b"").decode()
+                    params = parse_qs(query_string)
+                    if params.get("token", [""])[0] == self.token:
                         authenticated = True
 
-                    # 方式 2: ?token=<token> query parameter
-                    if not authenticated:
-                        from urllib.parse import parse_qs
-                        query_string = scope.get("query_string", b"").decode()
-                        params = parse_qs(query_string)
-                        if params.get("token", [""])[0] == self.token:
-                            authenticated = True
+                if not authenticated:
+                    response = JSONResponse(
+                        {"error": "Unauthorized", "message": "Invalid or missing token. Use Authorization: Bearer <token> header or ?token=<token> query param."},
+                        status_code=401
+                    )
+                    await response(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
 
-                    if not authenticated:
-                        response = JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing token. Use Authorization: Bearer <token> header or ?token=<token> query param."},
-                            status_code=401
-                        )
-                        await response(scope, receive, send)
-                        return
-                await self.app(scope, receive, send)
-
-        # 获取 FastMCP 的 SSE app 并包装认证中间件 + health 路由
-        sse_app = mcp.sse_app()
-        authenticated_app = BearerTokenMiddleware(sse_app, MCP_TOKEN)
-
-        # 组合路由: /health + SSE app
-        app = Starlette(routes=[
-            Route("/health", health_check),
-            Mount("/", app=authenticated_app),
-        ])
-        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    # 获取 MCP 协议的 ASGI app
+    if TRANSPORT == "streamable-http":
+        # Streamable HTTP (MCP 规范 2025-03-26，替代已废弃的 SSE)
+        # 单端点 /mcp，支持动态连接升级、断线重连、多客户端并发
+        try:
+            mcp_app = mcp.streamable_http_app()
+            logger.info("使用 Streamable HTTP 传输 (MCP 2025-03-26)")
+        except AttributeError:
+            # SDK 版本过低，回退到 SSE
+            logger.warning("MCP SDK 不支持 streamable_http_app()，回退到 SSE 传输")
+            logger.warning("请升级: pip install 'mcp[cli]>=1.10.0'")
+            mcp_app = mcp.sse_app()
+            TRANSPORT = "sse"
     else:
-        # 无认证模式: 仍然提供 /health 端点
-        sse_app = mcp.sse_app()
-        app = Starlette(routes=[
-            Route("/health", health_check),
-            Mount("/", app=sse_app),
-        ])
-        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+        # SSE (向后兼容旧客户端)
+        mcp_app = mcp.sse_app()
+        logger.info("使用 SSE 传输 (向后兼容模式)")
+
+    # 包装认证中间件
+    if MCP_TOKEN:
+        mcp_app = BearerTokenMiddleware(mcp_app, MCP_TOKEN)
+
+    # 组合路由: /health + MCP 协议端点
+    app = Starlette(routes=[
+        Route("/health", health_check),
+        Mount("/", app=mcp_app),
+    ])
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
