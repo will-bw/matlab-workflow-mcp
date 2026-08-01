@@ -415,9 +415,9 @@ class TaskScheduler:
         """取消任务（排队中直接移除，运行中杀进程）"""
         with self._lock:
             # 检查队列
-            for i, t in enumerate(self.queue):
+            for t in self.queue:
                 if t.task_id == task_id:
-                    del self.queue[i]  # deque 不支持 del by index, 用 rotate
+                    self.queue.remove(t)
                     t.mark_done("cancelled")
                     self._move_to_history(t)
                     return True
