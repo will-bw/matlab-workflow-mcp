@@ -1,32 +1,29 @@
-# MATLAB MCP Server 依赖
-# ========================
-# 安装命令: pip install -r requirements.txt
+# MATLAB MCP Server v3.0 依赖
+# ============================
+# 安装: pip install -r requirements.txt
 #
-# 注意: matlab.engine 需要从 MATLAB 安装目录单独安装:
-#   cd "C:\Program Files\MATLAB\R2022b\extern\engines\python"
-#   python setup.py install
+# v3.0 不再需要 MATLAB Engine API！
+# 仅需确保 matlab 可执行文件在 PATH 中（或设置 MATLAB_EXE 环境变量）。
 #
-# Python 版本要求: 3.9 - 3.10 (MATLAB R2022b 兼容 + MCP SDK 要求)
+# Python 版本要求: 3.9+
 
-# MCP SDK (含 Streamable HTTP + SSE 传输支持)
-# >=1.10.0 支持 Streamable HTTP (MCP 规范 2025-03-26)
+# MCP SDK (Streamable HTTP + SSE)
 mcp[cli]>=1.10.0
 
 # ASGI 服务器
 uvicorn>=0.27.0
 
-# HTTP 工具库 (MCP SDK 依赖)
+# HTTP 工具库
 httpx>=0.25.0
 
-# SSE 协议支持 (向后兼容旧客户端)
+# SSE 向后兼容
 sse-starlette>=1.6.0
 
 # 异步支持
 anyio>=4.0.0
 
-# Starlette (路由组合、/health 端点)
+# Starlette 路由
 starlette>=0.37.0
 
-# 系统资源监控 (CPU/内存/磁盘，可选但推荐)
-# 未安装时自动回退到 Windows wmic 命令
+# 系统资源监控 (CPU/内存/磁盘)
 psutil>=5.9.0
