@@ -58,5 +58,6 @@ CODE_REVIEW*.md
 # 环境变量（含敏感信息）
 # .env  — 注意：当前 .env 不含真实密钥，可入库作为模板
 # 如果添加了真实 token，取消下行注释：
-# .env
+
+.env
 .workbuddy/

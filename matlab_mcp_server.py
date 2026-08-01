@@ -1442,18 +1442,28 @@ def sync_status() -> str:
 
     syncthing_url = os.environ.get("SYNCTHING_URL", "http://127.0.0.1:8384")
 
+    # 解析 URL 中的认证信息 (格式: http://api:KEY@host:port)
+    from urllib.parse import urlparse
+    parsed = urlparse(syncthing_url)
+    api_key = parsed.password if parsed.password else None
+    base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 8384}"
+
     try:
         # 检查 Syncthing 是否运行
-        req = urllib.request.Request(f"{syncthing_url}/rest/system/status")
+        req = urllib.request.Request(f"{base_url}/rest/system/status")
         req.add_header("Accept", "application/json")
+        if api_key:
+            req.add_header("X-API-Key", api_key)
         with urllib.request.urlopen(req, timeout=5) as resp:
             status = json.loads(resp.read())
 
         my_id = status.get("myID", "unknown")[:12]
 
         # 检查连接
-        req2 = urllib.request.Request(f"{syncthing_url}/rest/system/connections")
+        req2 = urllib.request.Request(f"{base_url}/rest/system/connections")
         req2.add_header("Accept", "application/json")
+        if api_key:
+            req2.add_header("X-API-Key", api_key)
         with urllib.request.urlopen(req2, timeout=5) as resp2:
             conns = json.loads(resp2.read())
 
@@ -1469,8 +1479,10 @@ def sync_status() -> str:
                 result += f"  {icon} 设备 {dev_id[:12]}...: {'connected' if connected else 'disconnected'}\n"
 
         # 检查文件夹同步状态
-        req3 = urllib.request.Request(f"{syncthing_url}/rest/db/status?folder=paper2-code")
+        req3 = urllib.request.Request(f"{base_url}/rest/db/status?folder=paper2-code")
         req3.add_header("Accept", "application/json")
+        if api_key:
+            req3.add_header("X-API-Key", api_key)
         try:
             with urllib.request.urlopen(req3, timeout=5) as resp3:
                 folder_status = json.loads(resp3.read())
@@ -1594,9 +1606,15 @@ def diagnose(detail: str = "full") -> str:
         # Syncthing
         import urllib.request
         syncthing_url = os.environ.get("SYNCTHING_URL", "http://127.0.0.1:8384")
+        from urllib.parse import urlparse as _urlparse
+        _parsed = _urlparse(syncthing_url)
+        _api_key = _parsed.password if _parsed.password else None
+        _base_url = f"{_parsed.scheme}://{_parsed.hostname}:{_parsed.port or 8384}"
         try:
-            req = urllib.request.Request(f"{syncthing_url}/rest/system/status")
+            req = urllib.request.Request(f"{_base_url}/rest/system/status")
             req.add_header("Accept", "application/json")
+            if _api_key:
+                req.add_header("X-API-Key", _api_key)
             with urllib.request.urlopen(req, timeout=3) as resp:
                 st = _json.loads(resp.read())
             lines.append(f"  ✓ Syncthing: 运行中 (ID: {st.get('myID', '?')[:8]}...)")
