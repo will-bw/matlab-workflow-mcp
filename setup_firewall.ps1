@@ -20,6 +20,16 @@ if (-not $isAdmin) {
 $Port = 8080
 $RuleName = "MATLAB-MCP-Server"
 
+# 从 .env 读取 MCP_PORT（若存在）
+$EnvFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) ".env"
+if (Test-Path $EnvFile) {
+    Get-Content $EnvFile | ForEach-Object {
+        if ($_ -match '^\s*MCP_PORT\s*=\s*(\d+)') {
+            $Port = [int]$matches[1]
+        }
+    }
+}
+
 # ============ 方案 1: 仅局域网需要（使用 Tailscale 可跳过）============
 Write-Host ""
 Write-Host "注意: 如果使用 Tailscale 组网，Tailscale 走虚拟网卡，" -ForegroundColor Yellow
@@ -55,6 +65,8 @@ New-NetFirewallRule `
     | Out-Null
 
 Write-Host "  -> 规则已创建" -ForegroundColor Green
+
+Write-Host "  (从 .env 读取端口 $Port)" -ForegroundColor DarkGray
 
 # 可选: 限制来源 IP（更安全）
 Write-Host ""

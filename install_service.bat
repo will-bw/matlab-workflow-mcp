@@ -1,5 +1,6 @@
 ﻿@echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
 REM ============================================================
 REM  MATLAB MCP Server - Windows 服务安装脚本
 REM  使用 NSSM 将服务注册为 Windows 服务（开机自启动）
@@ -24,12 +25,32 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ============ 配置区域（根据实际环境修改）============
+REM ============ 配置区域（从 .env 读取，未配置则回退默认值）============
 set SERVICE_NAME=MatlabMCPServer
-set PYTHON_PATH=C:\Python310\python.exe
-set SCRIPT_PATH=E:\code\WinServerBuild\cleanup_and_start.py
-set WORKING_DIR=E:\code\Paper2
-set LOG_DIR=E:\code\WinServerBuild\logs
+
+REM 加载 .env 配置
+set ENV_FILE=%~dp0.env
+if exist "%ENV_FILE%" (
+    for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
+        set "_key=%%a"
+        set "_val=%%b"
+        if not "!_key!"=="" if not "!_val!"=="" (
+            for /f "tokens=*" %%x in ("!_key!") do set "_key=%%x"
+            for /f "tokens=*" %%x in ("!_val!") do set "_val=%%x"
+            set "!_key!=!_val!"
+        )
+    )
+)
+
+REM 回退默认值
+if not defined PYTHON_PATH set PYTHON_PATH=C:\Python310\python.exe
+if not defined SCRIPT_PATH set SCRIPT_PATH=%~dp0cleanup_and_start.py
+if not defined MATLAB_WORKING_DIR set MATLAB_WORKING_DIR=E:\code\Paper2
+if not defined LOG_DIR set LOG_DIR=E:\code\WinServerBuild\logs
+if not defined MCP_HOST set MCP_HOST=0.0.0.0
+if not defined MCP_PORT set MCP_PORT=8080
+if not defined MCP_TOKEN set MCP_TOKEN=
+set WORKING_DIR=%MATLAB_WORKING_DIR%
 REM ====================================================
 
 REM 检查 NSSM 是否存在
@@ -75,12 +96,18 @@ echo [1/4] 安装服务...
 echo [2/4] 配置服务参数...
 %NSSM% set %SERVICE_NAME% AppDirectory "%WORKING_DIR%"
 %NSSM% set %SERVICE_NAME% DisplayName "MATLAB MCP Server"
-%NSSM% set %SERVICE_NAME% Description "MATLAB 远程执行 MCP 服务 (SSE 传输, 端口 8080)"
+%NSSM% set %SERVICE_NAME% Description "MATLAB 远程执行 MCP 服务 (Streamable HTTP 传输, 端口 %MCP_PORT%)"
 %NSSM% set %SERVICE_NAME% Start SERVICE_AUTO_START
 %NSSM% set %SERVICE_NAME% ObjectName LocalSystem
 
 REM 设置环境变量
-%NSSM% set %SERVICE_NAME% AppEnvironmentExtra "MATLAB_WORKING_DIR=%WORKING_DIR%" "MCP_HOST=0.0.0.0" "MCP_PORT=8080"
+if defined MCP_TOKEN (
+    %NSSM% set %SERVICE_NAME% AppEnvironmentExtra "MATLAB_WORKING_DIR=%WORKING_DIR%" "MCP_HOST=%MCP_HOST%" "MCP_PORT=%MCP_PORT%" "MCP_TOKEN=%MCP_TOKEN%"
+) else (
+    %NSSM% set %SERVICE_NAME% AppEnvironmentExtra "MATLAB_WORKING_DIR=%WORKING_DIR%" "MCP_HOST=%MCP_HOST%" "MCP_PORT=%MCP_PORT%"
+    echo [警告] .env 未设置 MCP_TOKEN，服务将在无认证模式下运行
+    echo         公网/非信任网络下存在未授权访问风险！建议设置。
+)
 
 REM 配置日志输出
 %NSSM% set %SERVICE_NAME% AppStdout "%LOG_DIR%\service_stdout.log"
@@ -104,7 +131,7 @@ echo ============================================================
 echo   安装完成！
 echo.
 echo   服务名称: %SERVICE_NAME%
-echo   服务地址: http://0.0.0.0:8080/sse
+echo   服务地址: http://%MCP_HOST%:%MCP_PORT%/mcp
 echo   日志目录: %LOG_DIR%
 echo.
 echo   管理命令:

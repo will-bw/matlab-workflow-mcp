@@ -30,17 +30,17 @@ PORT = int(os.environ.get("MCP_PORT", "8080"))
 MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "3"))
 
 # 最大排队任务数（超过则拒绝提交）
-MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "10"))
+MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "5"))
 
 # 默认任务超时（秒）
 TASK_TIMEOUT_DEFAULT = int(os.environ.get("TASK_TIMEOUT_DEFAULT", "600"))
 
 # ============ 资源阈值 ============
 # CPU 使用率超过此值时不再启动新任务
-CPU_THRESHOLD = float(os.environ.get("CPU_THRESHOLD", "85"))
+CPU_THRESHOLD = float(os.environ.get("CPU_THRESHOLD", "90"))
 
 # 内存使用率超过此值时不再启动新任务
-MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", "80"))
+MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", "90"))
 
 # 磁盘使用率超过此值时警告
 DISK_THRESHOLD = float(os.environ.get("DISK_THRESHOLD", "95"))
@@ -59,11 +59,14 @@ CLIENT_CONFIG_EXAMPLE = """
 {
   "mcpServers": {
     "matlab": {
-      "type": "sse",
-      "url": "http://100.x.y.z:8080/sse"
+      "type": "http",
+      "url": "http://100.x.y.z:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
     }
   }
 }
 
-注: Qoder 会自动探测并使用 Streamable HTTP (端点 /mcp)。
+注: 传输为 Streamable HTTP（端点 /mcp），认证走请求头 Authorization: Bearer。
 """

@@ -1,14 +1,19 @@
 #!/bin/bash
 # ============================================================
 #  sync_and_run.sh - Mac 端一键同步+运行实验
+#  默认打印操作提示；设 REAL=1 时通过 MCP submit_task 真实提交。
 #  用法: ./sync_and_run.sh [实验命令]
-#  示例: ./sync_and_run.sh "RunAblationChunk(1, 1, 'output_base', 'results_matlab/test')"
+#  真实模式: REAL=1 ./sync_and_run.sh "RunAblationChunk(1,1,'output_base','results_matlab/test')"
+#  依赖: python3 + mcp_cli.py (标准库，无第三方包)
 # ============================================================
 
 set -e
 
 # ============ 配置 ============
 MCP_URL="${MCP_URL:-http://100.64.0.0:8080}"  # 替换为你的 Tailscale IP
+MCP_TOKEN="${MCP_TOKEN:-}"
+MCP_CLI="$(dirname "$0")/mcp_cli.py"
+REAL="${REAL:-0}"
 SYNCTHING_URL="http://127.0.0.1:8384"
 # ==============================
 
@@ -54,9 +59,10 @@ except:
     fi
 fi
 
-# 2. 检查 MCP Server 连通性
+# 2. 检查 MCP Server 连通性（/health 为认证白名单，无需 token）
 echo -e "${YELLOW}[2/3] 检查 MCP Server...${NC}"
-MCP_CHECK=$(curl -s -o /dev/null -w "%{http_code}" "$MCP_URL/sse" --max-time 5 2>/dev/null || echo "000")
+MCP_SERVER="${MCP_URL%/mc*}"  # 去掉 /mcp 或 /sse 得到 server 根
+MCP_CHECK=$(curl -s -o /dev/null -w "%{http_code}" "$MCP_SERVER/health" --max-time 5 2>/dev/null || echo "000")
 
 if [ "$MCP_CHECK" = "000" ]; then
     echo -e "  ${RED}✗ MCP Server 不可达: $MCP_URL${NC}"
@@ -89,10 +95,20 @@ fi
 MATLAB_CMD="$1"
 echo "  命令: $MATLAB_CMD"
 echo ""
+
+# 真实调用：通过 MCP submit_task 将命令作为后台任务提交
+if [ "$REAL" = "1" ]; then
+    echo -e "${GREEN}[真实调用]${NC} submit_task 提交中..."
+    python3 "$MCP_CLI" submit "$MATLAB_CMD" --url "$MCP_URL" --token "$MCP_TOKEN"
+    exit 0
+fi
+
 echo -e "  ${GREEN}提示: 在 Qoder 中直接说以下话即可执行:${NC}"
-echo "  \"在 MATLAB 中执行: $MATLAB_CMD\""
+echo "  \"在 MATLAB 中提交后台任务: $MATLAB_CMD\""
 echo ""
-echo "  或对于长时间实验:"
-echo "  \"提交后台任务: $MATLAB_CMD\""
+if [ -x "$(command -v python3)" ]; then
+  echo -e "${YELLOW}可选真实调用 (REAL=1):${NC}"
+  echo "  REAL=1 $0 \"$MATLAB_CMD\""
+fi
 echo ""
 echo "============================================================"

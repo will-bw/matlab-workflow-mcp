@@ -11,7 +11,7 @@ MATLAB MCP Server v3.0 - 子进程池架构
   - 前台 run 同步等待，后台 submit_task 立即返回
 
 传输: Streamable HTTP (MCP 2025-03-26) | SSE (向后兼容)
-工具: 18 个 MCP tools
+工具: 17 个 MCP tools
 兼容: MATLAB R2021a+ | Python 3.9+ | 无需 Engine API
 """
 
@@ -21,6 +21,7 @@ import io
 import time
 import base64
 import asyncio
+import hmac
 import logging
 import tempfile
 import threading
@@ -35,6 +36,18 @@ from mcp.server.fastmcp import FastMCP
 # ============ 日志配置 ============
 from logging.handlers import RotatingFileHandler
 
+# 配置加载须在日志初始化之前，确保 LOG_DIR 等来自 .env 的配置立即生效
+_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_file):
+    with open(_env_file, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                _key, _val = _key.strip(), _val.strip()
+                if _key and _val and _key not in os.environ:
+                    os.environ[_key] = _val
+
 _log_dir = os.environ.get("LOG_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(_log_dir, exist_ok=True)
 _log_path = os.path.join(_log_dir, "matlab_mcp_server.log")
@@ -48,18 +61,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), _log_handler],
 )
 logger = logging.getLogger("matlab-mcp")
-
-# ============ 配置加载 ============
-_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env_file):
-    with open(_env_file, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _key, _val = _line.split("=", 1)
-                _key, _val = _key.strip(), _val.strip()
-                if _key and _val and _key not in os.environ:
-                    os.environ[_key] = _val
 
 try:
     from config import (
@@ -93,7 +94,7 @@ mcp = FastMCP("matlab-server", host=HOST, port=PORT)
 if MCP_TOKEN:
     logger.info(f"Bearer Token 认证已启用 (token: {MCP_TOKEN[:4]}...)")
 else:
-    logger.warning("认证未启用！设置 MCP_TOKEN 环境变量启用。")
+    logger.warning("认证未启用！设置 MCP_TOKEN 环境变量启用。公网/非信任网络下部署存在未授权访问风险，强烈建议启用。")
 
 
 # ============ 工具函数 ============
@@ -106,6 +107,29 @@ def _error_response(error_type: str, message: str, elapsed: float = 0, hint: str
     if hint:
         result += f"\n建议: {hint}"
     return result
+
+
+MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+
+
+def _resolve_workspace_path(file_path: str) -> str:
+    """将用户输入路径解析为工作区内的绝对路径，防止路径沙箱逃逸。
+
+    - 绝对路径：校验其位于 MATLAB_WORKING_DIR 之内；
+    - 相对路径：先拼接到工作区再做校验（拦截 ../ 及盘符切换）。
+
+    越界时抛 PermissionError。
+    """
+    base = os.path.realpath(MATLAB_WORKING_DIR)
+    candidate = file_path if os.path.isabs(file_path) else os.path.join(MATLAB_WORKING_DIR, file_path)
+    candidate = os.path.realpath(candidate)
+    try:
+        if os.path.commonpath([base, candidate]) != base:
+            raise PermissionError(f"路径越界，拒绝访问工作区外路径: {file_path}")
+    except ValueError:
+        # 不同盘符（如 C:\ vs E:\）必然越界
+        raise PermissionError(f"路径越界，拒绝访问工作区外路径: {file_path}")
+    return candidate
 
 
 def truncate_output(text: str) -> str:
@@ -142,14 +166,28 @@ def _find_matlab_exe() -> str:
     )
 
 
+def _matlab_string_escape(s: str) -> str:
+    """将路径/字符串转为 MATLAB 单引号字符串内的合法字面量。
+
+    - 单引号须翻倍（''）；
+    - 反斜杠统一为 /，避免 MATLAB 将其解析为转义序列。
+    """
+    return s.replace("\\", "/").replace("'", "''")
+
+
 def _write_temp_script(code: str, task_id: str) -> str:
     """将 MATLAB 代码写入临时 .m 文件，返回文件路径"""
     script_name = f"_mcp_task_{task_id}.m"
     script_path = os.path.join(MATLAB_WORKING_DIR, script_name)
-    # 包装代码：添加 cd 和错误捕获
-    wrapped = f"cd('{MATLAB_WORKING_DIR}');\n"
+    # 包裹代码：添加 cd 和错误捕获（工作目录统一用正斜杠 + 单引号转义）
+    workdir = _matlab_string_escape(MATLAB_WORKING_DIR)
+    wrapped = f"cd('{workdir}');\n"
     wrapped += "try\n"
-    for line in code.split("\n"):
+    # 首行空行防护：剔除前导空行/空白，保证 try 块缩进正确；空代码给出占位语句
+    body = code.lstrip("\r\n \t")
+    if not body:
+        body = "disp('(empty script)')"
+    for line in body.split("\n"):
         wrapped += f"    {line}\n"
     wrapped += "catch ME\n"
     wrapped += "    fprintf(2, 'MATLAB_ERROR: %s\\n', ME.message);\n"
@@ -195,8 +233,17 @@ def _get_system_resources() -> dict:
                 "memory_total_gb": -1, "disk_percent": -1, "disk_free_gb": -1}
 
 
+_res_cache = {"ts": 0.0, "ok": True, "warnings": []}
+
+
 def _resources_ok() -> tuple:
-    """检查资源是否允许启动新任务。Returns: (ok, warnings)"""
+    """检查资源是否允许启动新任务。Returns: (ok, warnings)
+
+    带 <2s 缓存，避免前台频繁调用时被 psutil 阻塞采样。
+    """
+    now = time.monotonic()
+    if now - _res_cache["ts"] < 2.0:
+        return _res_cache["ok"], list(_res_cache["warnings"])
     res = _get_system_resources()
     warnings = []
     if res["cpu_percent"] >= 0 and res["cpu_percent"] > CPU_THRESHOLD:
@@ -205,7 +252,9 @@ def _resources_ok() -> tuple:
         warnings.append(f"内存 {res['memory_percent']:.0f}% > {MEMORY_THRESHOLD:.0f}%")
     if res["disk_percent"] >= 0 and res["disk_percent"] > DISK_THRESHOLD:
         warnings.append(f"磁盘 {res['disk_percent']:.0f}% > {DISK_THRESHOLD:.0f}%")
-    return len(warnings) == 0, warnings
+    ok = len(warnings) == 0
+    _res_cache.update(ts=now, ok=ok, warnings=warnings)
+    return ok, warnings
 
 
 # ============ 任务模型 ============
@@ -274,6 +323,9 @@ class ManagedTask:
             self.output_lines.append(line)
 
     def mark_done(self, status: str):
+        if self._done_event.is_set():
+            # 终态只允许写入一次（并发取消/超时/完成时保证幂等）
+            return
         self.status = status
         self.end_time = datetime.now()
         self._done_event.set()
@@ -297,7 +349,7 @@ class TaskScheduler:
         self.active: dict[str, ManagedTask] = {}  # task_id → running task
         self.queue: collections.deque = collections.deque()  # waiting tasks
         self.history: dict[str, ManagedTask] = {}  # finished tasks
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # 可重入，便于在持锁时安全调用 _move_to_history 等
         self._reader_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS + 2)
         # 启动后台调度线程
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
@@ -306,6 +358,8 @@ class TaskScheduler:
 
     def submit(self, task: ManagedTask) -> tuple:
         """提交任务。Returns: (accepted: bool, message: str)"""
+        launch_now = False
+        launch_msg = ""
         with self._lock:
             running_count = len(self.active)
             queue_count = len(self.queue)
@@ -318,8 +372,10 @@ class TaskScheduler:
             if running_count < MAX_CONCURRENT_TASKS:
                 res_ok, warnings = _resources_ok()
                 if res_ok or task.priority == 0:  # 前台任务强制启动
-                    self._launch(task)
-                    return True, f"任务已启动 (并发: {running_count+1}/{MAX_CONCURRENT_TASKS})"
+                    # 先占并发槽位，真实启动放到锁外（避免 Popen 耗时阻塞锁）
+                    self.active[task.task_id] = task
+                    launch_now = True
+                    launch_msg = f"任务已启动 (并发: {running_count+1}/{MAX_CONCURRENT_TASKS})"
                 else:
                     # 资源不足，入队
                     self.queue.append(task)
@@ -329,13 +385,21 @@ class TaskScheduler:
                 self.queue.append(task)
                 return True, f"并发已满 ({running_count}/{MAX_CONCURRENT_TASKS})，已入队 (位置: {queue_count+1})"
 
+        if launch_now:
+            # 锁外执行耗时操作（找 exe、写脚本、Popen）
+            self._launch(task)
+            return True, launch_msg
+
+
     def _launch(self, task: ManagedTask):
-        """启动一个 MATLAB 子进程执行任务"""
+        """启动一个 MATLAB 子进程执行任务（耗时操作，调用方应在锁外执行）"""
         try:
             matlab_exe = _find_matlab_exe()
         except FileNotFoundError as e:
             task.append_output(f"[错误] {str(e)}")
             task.mark_done("failed")
+            with self._lock:
+                self.active.pop(task.task_id, None)
             self._move_to_history(task)
             return
 
@@ -354,9 +418,10 @@ class TaskScheduler:
                 errors="replace",
             )
             task.process = proc
-            task.status = "running"
-            task.start_time = datetime.now()
-            self.active[task.task_id] = task
+            with self._lock:
+                task.status = "running"
+                task.start_time = datetime.now()
+                self.active[task.task_id] = task  # submit 已预登记；_try_dequeue 路径在此补充
             logger.info(f"任务启动: [{task.task_id}] PID={proc.pid}")
 
             # 启动输出读取线程
@@ -367,6 +432,8 @@ class TaskScheduler:
         except Exception as e:
             task.append_output(f"[启动失败] {str(e)}")
             task.mark_done("failed")
+            with self._lock:
+                self.active.pop(task.task_id, None)
             self._move_to_history(task)
             _cleanup_temp_script(task.task_id)
 
@@ -434,10 +501,11 @@ class TaskScheduler:
 
     def _move_to_history(self, task: ManagedTask):
         """移入历史记录（最多保留 50 条）"""
-        self.history[task.task_id] = task
-        if len(self.history) > 50:
-            oldest = min(self.history.values(), key=lambda t: t.submit_time)
-            del self.history[oldest.task_id]
+        with self._lock:
+            self.history[task.task_id] = task
+            if len(self.history) > 50:
+                oldest = min(self.history.values(), key=lambda t: t.submit_time)
+                del self.history[oldest.task_id]
 
     def _scheduler_loop(self):
         """后台调度循环：每 5s 检查是否可以启动队列中的任务"""
@@ -461,12 +529,13 @@ class TaskScheduler:
 
     def get_task(self, task_id: str) -> ManagedTask:
         """查找任务（active / queue / history）"""
-        if task_id in self.active:
-            return self.active[task_id]
-        for t in self.queue:
-            if t.task_id == task_id:
-                return t
-        return self.history.get(task_id)
+        with self._lock:
+            if task_id in self.active:
+                return self.active[task_id]
+            for t in self.queue:
+                if t.task_id == task_id:
+                    return t
+            return self.history.get(task_id)
 
     def get_status_summary(self) -> dict:
         with self._lock:
@@ -480,6 +549,21 @@ class TaskScheduler:
 
 # 全局调度器实例
 scheduler = TaskScheduler()
+
+
+def _join_task_sync(task: "ManagedTask", grace: int = 60) -> bool:
+    """同步等待单个任务执行结束，超时则自动取消。
+
+    Returns: True=在超时前进入终态；False=超时（或由看门狗标记为 timeout）且已取消。
+    """
+    finished = task._done_event.wait(timeout=task.timeout + grace)
+    if not finished:
+        scheduler.cancel(task.task_id, reason="timeout")
+        return False
+    if task.status == "timeout":
+        return False
+    return True
+
 
 # ============ 执行历史 ============
 _execution_history = collections.deque(maxlen=100)
@@ -573,7 +657,10 @@ def run_script(script_path: str, section: str = "") -> str:
     Returns:
         脚本执行输出
     """
-    resolved = script_path if os.path.isabs(script_path) else os.path.join(MATLAB_WORKING_DIR, script_path)
+    try:
+        resolved = _resolve_workspace_path(script_path)
+    except PermissionError:
+        return _error_response("PATH_TRANSLATION", f"路径越界，拒绝访问: {script_path}")
     if not os.path.exists(resolved):
         return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
 
@@ -621,7 +708,8 @@ def run_script(script_path: str, section: str = "") -> str:
     # 同步执行（复用 run 逻辑）
     task = ManagedTask(code=code, timeout=TASK_TIMEOUT_DEFAULT, priority=0)
     scheduler.submit(task)
-    task._done_event.wait(timeout=TASK_TIMEOUT_DEFAULT + 60)
+    if not _join_task_sync(task):
+        return _error_response("TIMEOUT", f"执行超时（>{TASK_TIMEOUT_DEFAULT}s），任务已终止")
     output = task.get_output()
     if task.status == "completed":
         return truncate_output(output) or "[执行完成，无输出]"
@@ -684,7 +772,7 @@ def get_task_status(task_id: str = "") -> str:
         "status": task.status,
         "elapsed": task.elapsed,
         "wait_time": task.wait_time,
-        "has_output": len(task.output_lines) > 0,
+        "has_output": bool(task.get_output()),
     }, ensure_ascii=False)
     result += f"\n---JSON---\n{json_block}"
     return result
@@ -728,16 +816,19 @@ def cancel_task(task_id: str) -> str:
 @mcp.tool()
 def list_tasks() -> str:
     """列出所有任务（运行中 + 排队 + 最近完成）。"""
+    with scheduler._lock:
+        active = list(scheduler.active.values())
+        queue = list(scheduler.queue)
+        recent = sorted(scheduler.history.values(), key=lambda t: t.submit_time)[-10:]
     parts = []
-    if scheduler.active:
+    if active:
         parts.append("[运行中]")
-        for t in scheduler.active.values():
+        for t in active:
             parts.append(t.to_summary())
-    if scheduler.queue:
+    if queue:
         parts.append("\n[排队中]")
-        for t in scheduler.queue:
+        for t in queue:
             parts.append(t.to_summary())
-    recent = sorted(scheduler.history.values(), key=lambda t: t.submit_time)[-10:]
     if recent:
         parts.append("\n[最近完成]")
         for t in reversed(recent):
@@ -828,14 +919,18 @@ def inspect(file_path: str) -> str:
     Args:
         file_path: .mat 文件路径（绝对或相对于工作目录）
     """
-    resolved = file_path if os.path.isabs(file_path) else os.path.join(MATLAB_WORKING_DIR, file_path)
+    try:
+        resolved = _resolve_workspace_path(file_path)
+    except PermissionError:
+        return _error_response("PATH_TRANSLATION", f"路径越界，拒绝访问: {file_path}")
     if not os.path.exists(resolved):
         return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
 
     code = f"whos('-file', '{resolved}')"
     task = ManagedTask(code=code, timeout=120, priority=0)
     scheduler.submit(task)
-    task._done_event.wait(timeout=180)
+    if not _join_task_sync(task):
+        return _error_response("TIMEOUT", f"检查超时（>{task.timeout}s），任务已终止")
     output = task.get_output()
     if task.status == "completed":
         return f"[文件: {os.path.basename(resolved)}]\n{output}"
@@ -852,7 +947,10 @@ def lint_code(code: str = "", file_path: str = "") -> str:
         file_path: 要检查的 .m 文件路径
     """
     if file_path:
-        resolved = file_path if os.path.isabs(file_path) else os.path.join(MATLAB_WORKING_DIR, file_path)
+        try:
+            resolved = _resolve_workspace_path(file_path)
+        except PermissionError:
+            return _error_response("PATH_TRANSLATION", f"路径越界，拒绝访问: {file_path}")
         if not os.path.exists(resolved):
             return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
         matlab_code = f"""
@@ -880,7 +978,8 @@ delete('{tmp}');"""
 
     task = ManagedTask(code=matlab_code, timeout=120, priority=0)
     scheduler.submit(task)
-    task._done_event.wait(timeout=180)
+    if not _join_task_sync(task):
+        return _error_response("TIMEOUT", f"检查超时（>{task.timeout}s），任务已终止")
     return truncate_output(task.get_output()) or "[检查完成]"
 
 
@@ -890,8 +989,7 @@ delete('{tmp}');"""
 def list_files(directory: str = ".", pattern: str = "*") -> str:
     """列出远程目录文件。"""
     try:
-        d = MATLAB_WORKING_DIR if directory == "." else (
-            directory if os.path.isabs(directory) else os.path.join(MATLAB_WORKING_DIR, directory))
+        d = MATLAB_WORKING_DIR if directory == "." else _resolve_workspace_path(directory)
         if not os.path.exists(d):
             return f"[错误] 目录不存在: {d}"
         files = []
@@ -911,11 +1009,14 @@ def list_files(directory: str = ".", pattern: str = "*") -> str:
 @mcp.tool()
 def transfer_file(file_path: str) -> str:
     """读取 Windows 端文件，返回 base64。限 50MB。"""
-    resolved = file_path if os.path.isabs(file_path) else os.path.join(MATLAB_WORKING_DIR, file_path)
+    try:
+        resolved = _resolve_workspace_path(file_path)
+    except PermissionError:
+        return _error_response("PATH_TRANSLATION", f"路径越界，拒绝访问: {file_path}")
     if not os.path.exists(resolved):
         return f"[错误] 文件不存在: {resolved}"
     size = os.path.getsize(resolved)
-    if size > 50 * 1024 * 1024:
+    if size > MAX_TRANSFER_BYTES:
         return f"[错误] 文件过大: {size/1024/1024:.1f}MB (限 50MB)"
     with open(resolved, "rb") as f:
         data = base64.b64encode(f.read()).decode()
@@ -925,10 +1026,15 @@ def transfer_file(file_path: str) -> str:
 @mcp.tool()
 def upload_file(file_path: str, base64_data: str) -> str:
     """将 base64 数据写入 Windows 端文件。"""
-    resolved = file_path if os.path.isabs(file_path) else os.path.join(MATLAB_WORKING_DIR, file_path)
+    try:
+        resolved = _resolve_workspace_path(file_path)
+    except PermissionError:
+        return _error_response("PATH_TRANSLATION", f"路径越界，拒绝访问: {file_path}")
     try:
         os.makedirs(os.path.dirname(resolved), exist_ok=True)
         data = base64.b64decode(base64_data)
+        if len(data) > MAX_TRANSFER_BYTES:
+            return _error_response("FILE_TOO_LARGE", f"数据过大: {len(data)/1024/1024:.1f}MB (限 {MAX_TRANSFER_BYTES//1024//1024}MB)")
         with open(resolved, "wb") as f:
             f.write(data)
         return f"[成功] 已写入: {resolved} ({len(data)} bytes)"
@@ -951,6 +1057,7 @@ def save_figure(figure_code: str, filename: str = "", format: str = "png", dpi: 
     """
     if not filename:
         filename = f"figure_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    filename = os.path.basename(filename)  # 防目录穿越
     export_path = f"exports/{filename}.{format}"
     code = f"""
 {figure_code}
@@ -960,10 +1067,11 @@ fprintf('图片已保存: {export_path}\\n');
 """
     task = ManagedTask(code=code, timeout=300, priority=0)
     scheduler.submit(task)
-    task._done_event.wait(timeout=360)
+    if not _join_task_sync(task):
+        return _error_response("TIMEOUT", f"出图超时（>{task.timeout}s），任务已终止")
     output = task.get_output()
     if task.status == "completed":
-        full_path = os.path.join(MATLAB_WORKING_DIR, export_path)
+        full_path = _resolve_workspace_path(export_path)
         return f"[图片已保存] {full_path}\n通过 Syncthing 同步到 Mac 后读取。"
     return _error_response("MATLAB_ERROR", output or "出图失败")
 
@@ -1115,14 +1223,10 @@ if __name__ == "__main__":
                     return
                 authenticated = False
                 headers = dict(scope.get("headers", []))
-                auth = headers.get(b"authorization", b"").decode()
-                if auth.startswith("Bearer ") and auth[7:] == self.token:
-                    authenticated = True
-                if not authenticated:
-                    from urllib.parse import parse_qs
-                    qs = scope.get("query_string", b"").decode()
-                    if parse_qs(qs).get("token", [""])[0] == self.token:
-                        authenticated = True
+                auth = headers.get(b"authorization", b"")
+                if auth.startswith(b"Bearer "):
+                    supplied = auth[7:].decode()
+                    authenticated = hmac.compare_digest(supplied, self.token)
                 if not authenticated:
                     resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
                     await resp(scope, receive, send)

@@ -11,6 +11,16 @@ Write-Host ""
 # ============ 配置区域 ============
 $Paper2Dir = "E:\code\Paper2"
 $SyncPort = 22000
+
+# 从 .env 读取 MATLAB_WORKING_DIR（若存在）
+$EnvFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) ".env"
+if (Test-Path $EnvFile) {
+    Get-Content $EnvFile | ForEach-Object {
+        if ($_ -match '^\s*MATLAB_WORKING_DIR\s*=\s*(.+)') {
+            $Paper2Dir = $matches[1].Trim()
+        }
+    }
+}
 # ==================================
 
 # 1. 检查/下载 Syncthing
@@ -122,7 +132,7 @@ Write-Host ""
 Write-Host "  6. 在 Mac 端接受共享邀请" -ForegroundColor White
 Write-Host ""
 Write-Host "  注意: 实验结果(.mat)不需要同步，" -ForegroundColor Yellow
-Write-Host "  通过 MCP 工具远程分析 (get_variable, execute_code, save_figure)" -ForegroundColor Yellow
+Write-Host "  通过 MCP 工具远程分析 (run_script, inspect, save_figure)" -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan
 
 Read-Host "按回车退出"

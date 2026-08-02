@@ -2,7 +2,7 @@
 
 > 从零开始到完整可用的详细指南。Windows 端运行 MATLAB 服务，Mac 端通过 Qoder/QoderWork 远程调用。
 >
-> 适用版本：matlab_mcp_server.py（21 个工具）| 更新日期：2026-07-28
+> 适用版本：matlab_mcp_server.py（17 个工具）| 更新日期：2026-07-28
 
 ---
 
@@ -10,7 +10,7 @@
 
 1. [系统架构](#一系统架构)
 2. [环境准备（Windows 端）](#二环境准备windows-端)
-3. [安装 MATLAB Engine API](#三安装-matlab-engine-api)
+3. [确认 MATLAB 可执行](#三确认-matlab-可执行)
 4. [部署 MCP Server](#四部署-mcp-server)
 5. [网络配置（Tailscale）](#五网络配置tailscale)
 6. [防火墙配置](#六防火墙配置)
@@ -32,11 +32,11 @@
 ```
 Mac (Qoder / QoderWork)                    Windows PC
 ┌─────────────────────┐                   ┌──────────────────────────────────────┐
-│  MCP Client (SSE)   │   HTTP/SSE       │  matlab_mcp_server.py                │
-│                     │ ───────────────►  │    ├─ FastMCP (SSE transport)        │
+│  MCP Client (HTTP)  │   HTTP/SSE       │  matlab_mcp_server.py                │
+│                     │ ───────────────►  │    ├─ FastMCP (Streamable HTTP)      │
 │  局域网: 直连 IP    │                   │    ├─ Bearer Token 认证中间件         │
-│  公网: Tailscale IP │                   │    ├─ 21 个工具 (执行/查询/实验/管理) │
-│                     │                   │    └─ MATLAB Engine (持久会话)        │
+│  公网: Tailscale IP │                   │    ├─ 17 个工具 (执行/查询/实验/管理) │
+│                     │                   │    └─ 子进程池 + matlab -batch       │
 └─────────────────────┘                   └──────────────────────────────────────┘
         │                                                │
         │          Syncthing (代码双向同步)               │
@@ -45,10 +45,10 @@ Mac (Qoder / QoderWork)                    Windows PC
 ```
 
 **核心特性：**
-- 持久 MATLAB 会话：变量不丢失，支持连续交互
-- SSE 传输：支持局域网和 Tailscale 公网
-- 统一加锁：所有 MATLAB Engine 调用经 `matlab_eval` 串行化，前台工具与后台任务不会并发冲突
-- 可选认证：Bearer Token（header 或 `?token=` query parameter）
+- 子进程池 + `matlab -batch`：每次执行独立进程，真正并行，无持久会话
+- Streamable HTTP 传输：统一端点 `/mcp`，支持局域网和 Tailscale 公网
+- 独立进程隔离：前台工具与后台任务无并发锁冲突
+- 可选认证：`Authorization: Bearer` header（不支持 `?token=` query）
 - 实验元数据：每次实验自动生成 `manifest.json`（算法/种子/git commit/参数快照）
 - 为 Paper2 (UAV 4D 路径规划) 项目定制
 
@@ -70,7 +70,9 @@ python --version
 
 ### 2.2 确认 MATLAB 安装
 
-确保 MATLAB R2022b 已安装，记住安装路径（默认 `C:\Program Files\MATLAB\R2022b`）。
+确保 MATLAB R2022b 已安装，并确认 `matlab` 命令在 PATH 中，或在 `.env` 设置 `MATLAB_EXE` 指向 `matlab.exe` 完整路径。
+
+验证: `where matlab` 应有输出。
 
 ### 2.3 确认项目路径
 
@@ -78,27 +80,24 @@ python --version
 
 ---
 
-## 三、安装 MATLAB Engine API
+## 三、确认 MATLAB 可执行
 
-在 PowerShell 中执行：
+本服务使用子进程池 + `matlab -batch` 调用，**无需安装 MATLAB Engine API**。只需保证 `matlab` 命令位于 PATH 中，或在 `.env` 设置 `MATLAB_EXE`。
+
+验证 `matlab` 在 PATH：
 
 ```powershell
-# 进入 MATLAB Engine 目录（根据实际安装路径调整）
-cd "C:\Program Files\MATLAB\R2022b\extern\engines\python"
-
-# 安装 Engine API
-python setup.py install
+where matlab
+# 应输出类似: C:\Program Files\MATLAB\R2022b\bin\matlab.exe
 ```
 
-**验证安装：**
-```powershell
-python -c "import matlab.engine; print('MATLAB Engine API OK')"
+如果不在 PATH，在 `.env` 中设置：
+
+```ini
+MATLAB_EXE=C:\Program Files\MATLAB\R2022b\bin\matlab.exe
 ```
 
-> 如果报错，检查:
-> - Python 版本是否为 3.8-3.10
-> - 是否使用了正确的 python 命令（可能需要 `py -3.10`）
-> - MATLAB 路径是否正确
+> 无需 `pip install matlabengine`，无需 `import matlab.engine`。
 
 ---
 
@@ -110,7 +109,7 @@ python -c "import matlab.engine; print('MATLAB Engine API OK')"
 
 ```
 E:\code\WinServerBuild\
-├── matlab_mcp_server.py      # 主服务（21 个工具）
+├── matlab_mcp_server.py      # 主服务（17 个工具）
 ├── cleanup_and_start.py      # 安全启动器（清理残留进程 + 启动主服务）
 ├── mcp_run_experiment.m      # MATLAB 实验执行器（由 run_experiment 调用）
 ├── config.py                 # 配置兜底（环境变量 > .env > config.py > 默认值）
@@ -145,8 +144,8 @@ pip install -r requirements.txt
 ```ini
 # .env 文件示例
 MATLAB_WORKING_DIR=E:\code\Paper2
-MCP_SERVER_DIR=E:\code\WinServerBuild
 PYTHON_PATH=C:\Python310\python.exe
+MATLAB_EXE=C:\Program Files\MATLAB\R2022b\bin\matlab.exe  # 可选（matlab 在 PATH 时省略）
 
 # 网络
 MCP_HOST=0.0.0.0
@@ -163,17 +162,16 @@ LOG_DIR=E:\code\WinServerBuild\logs
 
 # 资源阈值
 CPU_THRESHOLD=90
-MEMORY_THRESHOLD=85
+MEMORY_THRESHOLD=90
 DISK_THRESHOLD=95
+MAX_CONCURRENT_TASKS=3
 MAX_QUEUE_SIZE=5
-MAX_RUNNING_TASKS=1
 ```
 
 **配置优先级**（高 → 低）：
 1. 系统环境变量（NSSM 的 `AppEnvironmentExtra` 等）
-2. `.env` 文件
+2. `.env` 文件（**唯一权威**）
 3. `config.py`
-4. 代码内默认值
 
 ### 4.4 启动服务
 
@@ -192,14 +190,13 @@ python matlab_mcp_server.py
 ```powershell
 python cleanup_and_start.py
 ```
-> `cleanup_and_start.py` 会先清理残留的 MATLAB Engine 进程（仅清理 `-automation` 模式的后台引擎，不影响用户打开的交互式 MATLAB），然后启动主服务。
+> `cleanup_and_start.py` 会先清理残留的 `matlab -batch` 子进程（仅清理 `-batch` 模式的后台进程，不影响用户打开的交互式 MATLAB），然后启动主服务。
 
 **成功标志：**
 ```
 MATLAB MCP Server 启动
-  监听地址: http://0.0.0.0:8080/sse
+  监听地址: http://0.0.0.0:8080/mcp
   工作目录: E:\code\Paper2
-MATLAB Engine 已启动，工作目录: E:\code\Paper2
 ```
 
 ---
@@ -240,8 +237,8 @@ ping 100.x.y.z  # 替换为 Windows 的 Tailscale IP
 
 ### 5.4 确定连接地址
 
-- **局域网**: `http://192.168.1.100:8080/sse`（Windows 内网 IP）
-- **公网 (Tailscale)**: `http://100.x.y.z:8080/sse`（Tailscale 分配的 IP）
+- **局域网**: `http://192.168.1.100:8080/mcp`（Windows 内网 IP）
+- **公网 (Tailscale)**: `http://100.x.y.z:8080/mcp`（Tailscale 分配的 IP）
 
 > 使用 Tailscale 后，无论你在哪个网络，配置永远不用改。
 
@@ -273,7 +270,7 @@ New-NetFirewallRule -Name 'MATLAB-MCP' -DisplayName 'MATLAB MCP Server' `
 Get-NetTCPConnection -LocalPort 8080
 
 # 从 Mac 测试
-curl http://100.x.y.z:8080/sse
+curl http://100.x.y.z:8080/mcp
 ```
 
 ---
@@ -293,27 +290,14 @@ MCP_TOKEN=your-secret-token-here
 
 ### 7.2 Mac 端连接方式
 
-认证启用后，Mac 端 SSE URL 需附加 token 参数。支持两种方式：
+认证启用后，Mac 端通过请求头 `Authorization: Bearer <MCP_TOKEN>` 认证。**仅支持 header 方式，不支持 query 参数**（避免 token 泄露进 URL/日志）。
 
-**方式 1: Query parameter（推荐，兼容性最好）**
 ```json
 {
   "mcpServers": {
     "matlab": {
-      "type": "sse",
-      "url": "http://100.x.y.z:8080/sse?token=your-secret-token-here"
-    }
-  }
-}
-```
-
-**方式 2: Authorization header（需客户端支持自定义 header）**
-```json
-{
-  "mcpServers": {
-    "matlab": {
-      "type": "sse",
-      "url": "http://100.x.y.z:8080/sse",
+      "type": "http",
+      "url": "http://100.x.y.z:8080/mcp",
       "headers": {
         "Authorization": "Bearer your-secret-token-here"
       }
@@ -322,7 +306,7 @@ MCP_TOKEN=your-secret-token-here
 }
 ```
 
-> **提示**：多数 MCP 客户端（包括 Qoder）的 SSE 配置不支持自定义 header，推荐使用 query parameter 方式。
+> 认证比较使用常量时间比较（`hmac.compare_digest`），且 token 经请求头传递，不会进入日志或浏览器历史。
 
 ---
 
@@ -336,8 +320,11 @@ MCP_TOKEN=your-secret-token-here
 {
   "mcpServers": {
     "matlab": {
-      "type": "sse",
-      "url": "http://100.x.y.z:8080/sse"
+      "type": "http",
+      "url": "http://100.x.y.z:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
     }
   }
 }
@@ -345,7 +332,7 @@ MCP_TOKEN=your-secret-token-here
 
 将 `100.x.y.z` 替换为 Windows 的 Tailscale IP（或局域网 IP）。
 
-如果启用了认证，URL 改为 `http://100.x.y.z:8080/sse?token=your-token`。
+如果启用了认证，务必设置 `headers` 中的 Bearer Token。未启用认证可省略 `headers`。
 
 ### 8.2 测试连接
 
@@ -353,17 +340,17 @@ MCP_TOKEN=your-secret-token-here
 
 ```bash
 cd /path/to/WinServerBuild
-python3 test_connection.py http://100.x.y.z:8080/sse
+python3 test_connection.py http://100.x.y.z:8080/mcp --token YOUR_TOKEN
 ```
 
-脚本会依次测试 HTTP 连通性和 MCP 协议握手，并输出诊断信息。
+脚本会依次测试 HTTP 连通性和 MCP 协议握手（真实的 `initialize`），并输出诊断信息。
 
 ### 8.3 验证工具可用
 
 配置完成后，在 Qoder 中尝试：
-- "获取 MATLAB 状态" → 应调用 `get_status` 工具
-- "查看工作区变量" → 应调用 `get_workspace` 工具
-- "健康检查" → 应调用 `health_check` 工具
+- "获取 MATLAB 状态" → 应调用 `sync_status` 工具
+- "查看工作区文件" → 应调用 `inspect` 工具
+- "健康检查" → 应访问 `/health` 端点
 
 ---
 
@@ -376,7 +363,7 @@ python3 test_connection.py http://100.x.y.z:8080/sse
 3. 修改 `install_service.bat` 中的路径配置（或确保 `.env` 已正确配置）
 4. 右键 → 以管理员身份运行 `install_service.bat`
 
-> NSSM 实际调用的是 `cleanup_and_start.py`（而非直接调用 `matlab_mcp_server.py`），这样在服务崩溃重启时会自动清理残留的 MATLAB Engine 进程。
+> NSSM 实际调用的是 `cleanup_and_start.py`（而非直接调用 `matlab_mcp_server.py`），这样在服务崩溃重启时会自动清理残留的 `matlab -batch` 进程。
 
 **管理命令：**
 ```powershell
@@ -413,7 +400,7 @@ Mac (~/Desktop/codes/Paper2/)  ◄══ Syncthing ══►  Windows (E:\code\P
 ```
 
 > **设计决策**: 实验结果 (.mat) 不同步回 Mac。
-> 分析结果通过 MCP 工具远程完成（`execute_code` 加载 .mat、`get_variable` 查看数据、`save_figure` 导出图表）。
+> 分析结果通过 MCP 工具远程完成（`inspect` 查看 .mat 数据、`run_script` 加载分析、`save_figure` 导出图表）。
 > 这样避免了大文件传输，且分析环境（MATLAB）就在 Windows 端。
 
 ### 快速配置
@@ -489,7 +476,7 @@ master          ← 稳定版本
 
 ## 十二、功能接口说明
 
-当前共 21 个工具（经三轮审查精简），按功能分类：
+当前共 17 个工具（经三轮审查精简），按功能分类：
 
 ### 执行类
 
@@ -508,20 +495,19 @@ master          ← 稳定版本
 | `get_task_output` | 获取任务输出（运行中返回增量） |
 | `cancel_task` | 取消后台任务 |
 | `list_tasks` | 列出所有任务 |
+| `get_history` | 查看已完成任务历史 |
 
 ### 工作区
 
 | 工具 | 功能 |
 |------|------|
-| `inspect` | 查看工作区/变量值/struct 结构（mode 参数控制） |
-| `set_variable` | 设置变量 |
+| `inspect` | 查看 .m 脚本/工作区变量/struct 结构
 
 ### 图形与文件
 
 | 工具 | 功能 |
 |------|------|
 | `save_figure` | 导出图形为 PNG (base64) |
-| `get_figure_info` | 获取图形元数据（坐标轴/标签/图例） |
 | `transfer_file` | 下载文件 (base64) |
 | `upload_file` | 上传文件 |
 | `list_files` | 列出目录文件 |
@@ -538,9 +524,6 @@ master          ← 稳定版本
 |------|------|
 | `diagnose` | 系统诊断（detail=quick 只看资源，detail=full 全链路） |
 | `sync_status` | 检查 Syncthing 同步状态 |
-| `reset_session` | 重置 MATLAB 工作区 |
-| `change_directory` | 切换工作目录 |
-| `force_restart_engine` | 强制重启 MATLAB Engine（清理卡死状态） |
 
 ### 工具选择指南
 
@@ -575,11 +558,11 @@ master          ← 稳定版本
 
 ### 典型实验工作流：
 
-1. **检查环境**: "健康检查" → `health_check`
-2. **运行实验**: "运行实验，算法 HeteroPSO-KR，模型 1-10，输出到 results_matlab/ablation_test" → `run_experiment`
-3. **查看元数据**: "读取 results_matlab/ablation_test/manifest.json" → `execute_code`
+1. **检查环境**: "健康检查" → 访问 `http://<IP>:8080/mcp` 或调用 `diagnose`
+2. **运行实验**: "运行实验，算法 HeteroPSO-KR，模型 1-10，输出到 results_matlab/ablation_test" → `experiment`
+3. **查看元数据**: "读取 results_matlab/ablation_test/manifest.json" → `run_script`
 4. **查看结果**: "列出 results_matlab/ablation_test 下的文件" → `list_files`
-5. **分析数据**: "加载 model_1_result.mat 并显示 cost" → `execute_code`
+5. **分析数据**: "加载 model_1_result.mat 并显示 cost" → `run`
 6. **导出图形**: "绘制收敛曲线并导出为 PNG" → `save_figure`
 
 ### mcp_run_experiment.m 参数说明
@@ -613,15 +596,15 @@ master          ← 稳定版本
 3. [Mac/Qoder] 通过 MCP 执行:
    - "检查同步状态"         → sync_status
    - "检查代码有没有问题"   → lint_code
-   - "快速测试模型 1"       → run_and_wait
+   - "快速测试模型 1"      → run
    - "提交后台实验 56 场景" → submit_task
        ↓
 4. [Mac/Qoder] 跟踪进度:
    - "任务 T0001 跑完了吗"  → get_task_status
        ↓
 5. [结果分析] 通过 MCP 远程完成（不同步 .mat 到 Mac）:
-   - "读取 manifest.json"               → execute_code
-   - "load results_matlab/xxx.mat; disp(cost)"  → execute_code
+   - "读取 manifest.json"               → run_script
+   - "load results_matlab/xxx.mat; disp(cost)"  → run
    - "绘制收敛曲线并导出 PNG"            → save_figure
        ↓
 6. [Mac/Qoder] 对比分析:
@@ -629,15 +612,13 @@ master          ← 稳定版本
    - "绘制多组实验的收敛曲线对比图"
 ```
 
-### 持久会话调试技巧
+### 无持久会话的调试技巧
 
-由于 MATLAB 会话是持久的，可以像交互式调试一样：
+由于每次执行都是独立的 `matlab -batch` 进程（无持久会话），调试时需在**单次调用内**完成前置与执行：
 
-1. 先执行前置代码加载数据: `"load Model56.mat; model = Model{1};"`
-2. 设置参数: `"opts.maxevals = 1000; opts.particles = 50;"`
-3. 执行算法: `"[cost, sol] = alg_HeteroPSO_KR([], opts, model);"`
-4. 检查结果: `"disp(cost); get_struct_info('sol')"`
-5. 如果出错，变量仍在，可以继续调查
+1. 一次性传入脚本: `"load Model56.mat; model = Model{1}; [cost, sol] = alg_HeteroPSO_KR([], opts, model); disp(cost)"`
+2. 需要较长时间时用 `submit_task`，事后用 `get_task_output` 读取结果
+3. 若出错，重新执行并结合 `SYNERR`/输出排查，或分段 `run` 定位
 
 ---
 
@@ -647,11 +628,10 @@ master          ← 稳定版本
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
-| `ModuleNotFoundError: matlab.engine` | Engine API 未安装 | 重新执行 `python setup.py install` |
 | `ModuleNotFoundError: mcp` | MCP SDK 未安装 | `pip install "mcp[cli]" uvicorn` |
-| MATLAB Engine 启动超时 | MATLAB 未正确安装 | 确认 MATLAB 可正常打开 |
+| MATLAB 启动超时 | MATLAB 不在 PATH | 将 matlab bin 加入 PATH 或设 `MATLAB_EXE` |
 | 端口被占用 | 其他程序占用 8080 | 改端口或关闭占用程序 |
-| 401 Unauthorized | 认证 token 不匹配 | 检查 `.env` 中 `MCP_TOKEN` 与客户端 URL 中 `?token=` 是否一致 |
+| 401 Unauthorized | 认证 token 不匹配 | 检查 `.env` 中 `MCP_TOKEN` 与客户端 header Bearer 是否一致 |
 
 ### 连接问题
 
@@ -660,16 +640,15 @@ master          ← 稳定版本
 | Mac 无法连接 | 防火墙阻止 | 运行 `setup_firewall.ps1` |
 | Tailscale 不通 | Tailscale 未连接 | 检查系统托盘图标 |
 | 连接超时 | 服务未启动 | 检查 Windows 端日志 |
-| SSE 断开 | 网络不稳定 | Tailscale 会自动重连 |
-| 工具调用卡住 | 后台任务持有引擎锁 | 等待后台任务完成，或用 `force_restart_engine` |
+| HTTP 连接断开 | 网络不稳定 | Tailscale 会自动重连 |
 
-### MATLAB Engine 卡死
+### `matlab -batch` 子进程卡死
 
-如果工具调用长时间无响应，可能是 MATLAB Engine 卡死：
+如果工具调用长时间无响应，可能是 MATLAB 子进程卡死：
 
-1. 先尝试 `force_restart_engine` 工具（仅杀 `-automation` 模式的引擎进程）
-2. 如果服务级别也卡住，重启 NSSM 服务：`nssm restart MatlabMCPServer`
-3. 极端情况下手动清理：`taskkill /F /IM MATLAB.exe`（会杀所有 MATLAB，包括交互式）
+1. 等待超时后服务会自动 cancel 对应任务
+2. 如多个任务卡死，重启 NSSM 服务：`nssm restart MatlabMCPServer`
+3. 极端情况下手动清理：`python cleanup_and_start.py`（仅清理 `-batch` 后台进程）
 
 ### 调试流程
 
@@ -678,19 +657,17 @@ master          ← 稳定版本
    ↓
 2. "检查这段代码" → lint_code 静态分析
    ↓
-3. "执行到第 X 行停下来，显示变量" → execute_code 逐步执行
+3. "查看文件结构/变量" → inspect
    ↓
-4. "查看 result 变量的结构" → get_struct_info / get_variable
-   ↓
-5. [Mac] 修改代码 → Syncthing 同步 → 重新运行
+4. [Mac] 修改代码 → Syncthing 同步 → 重新运行
 ```
 
 ### 常用调试命令 (在 Qoder 中直接说)
 
 ```
-"在 MATLAB 中执行 dbstop if error"       ← 出错时自动暂停
-"查看工作区变量"                        ← get_workspace
-"获取 model 变量的字段结构"            ← get_struct_info('model')
+"运行这段 MATLAB 代码，打印结果"
+"查看调度器状态"                        → list_tasks/diagnose
+"列出 results 目录下的 .mat 文件"        → list_files
 "执行 try, alg_HeteroPSO_KR([], opts, model), catch ME, disp(ME), end"
 ```
 
@@ -716,21 +693,18 @@ type E:\code\Paper2\diary.log
 
 ### 已实现
 
-- ✅ 异步执行 + 超时保护（`asyncio.wait_for`）
-- ✅ 统一加锁（`matlab_eval` + `_engine_lock`，前台与后台不冲突）
+- ✅ 异步执行 + 超时保护（子进程 `-batch` 超时 cancel）
+- ✅ 子进程池：前台工具与后台任务独立进程并行
 - ✅ 自动图形捕获
-- ✅ 段落执行 `execute_section`
+- ✅ 段落执行 `run_script(section=...)`
 - ✅ 代码质量检查 `lint_code`（临时文件自动清理）
-- ✅ struct 元数据检查 `get_struct_info`
-- ✅ 图形元数据 `get_figure_info`
-- ✅ 后台任务队列 + 状态管理
-- ✅ Bearer Token 认证（header + query parameter）
-- ✅ 任务注册表自动清理
+- ✅ 后台任务队列 + 状态/历史管理 + 50 上限
+- ✅ Bearer Token 认证（仅 `Authorization` header，常量时间比较）
+- ✅ 路径沙箱（禁止逃逸出工作目录）
 - ✅ 日志轮转（RotatingFileHandler）
 - ✅ 实验元数据快照（`mcp_run_experiment.m` → `manifest.json`）
 - ✅ 随机种子确定性管理
-- ✅ MATLAB Engine 强制重启
-- ✅ 精确进程清理（仅杀 `-automation` 引擎，不影响交互式 MATLAB）
+- ✅ 精确进程清理（仅杀 `-batch` 子进程，不影响交互式 MATLAB）
 
 ### 待实现
 
@@ -739,7 +713,7 @@ type E:\code\Paper2\diary.log
 - **实验管理**: 断点续跑（记录已完成模型，中断后继续）、自动结果对比
 - **操作审计**: 记录所有工具调用日志到独立审计文件
 - **增量输出**: 后台任务运行中可读取 stdout 增量
-- **工具精简**: 已从 28 个精简至 21 个（执行类 7→4、监控类 3→1、工作区 3→1）✓ 已完成
+- **工具精简**: 已精简并收敛至 17 个 ✓ 已完成
 
 ---
 

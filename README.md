@@ -7,13 +7,13 @@
 ```
 Mac (Qoder IDE)                         Windows (MATLAB R2022b)
 ┌───────────────────┐                  ┌──────────────────────────────┐
-│  MCP Client (SSE) │ ─── Tailscale ──►│  matlab_mcp_server.py        │
-│  Syncthing        │ ◄── P2P Sync ───►│  MATLAB Engine (持久会话)     │
-│  Git              │                  │  21 个 MCP 工具              │
+│  MCP Client (HTTP)│ ─── Tailscale ──►│  matlab_mcp_server.py        │
+│  Syncthing        │ ◄── P2P Sync ───►│  子进程池 + matlab -batch    │
+│  Git              │                  │  17 个 MCP 工具              │
 └───────────────────┘                  └──────────────────────────────┘
 ```
 
-- **执行层**: MCP over SSE (:8080)，支持 Bearer Token + query param 认证
+- **执行层**: 子进程池 + `matlab -batch`（Streamable HTTP, :8080），独立进程真正并行，无持久 Engine 会话
 - **同步层**: Syncthing P2P (:22000)，代码实时双向同步
 - **网络层**: Tailscale (WireGuard)，局域网/公网自动切换
 
@@ -22,16 +22,13 @@ Mac (Qoder IDE)                         Windows (MATLAB R2022b)
 ### Windows 端
 
 ```powershell
-# 1. 安装 MATLAB Engine API
-cd "C:\Program Files\MATLAB\R2022b\extern\engines\python"
-python setup.py install
-
-# 2. 安装依赖
+# 1. 安装依赖（无需 MATLAB Engine API）
 pip install -r requirements.txt
 
-# 3. 修改 .env 配置（MATLAB_WORKING_DIR 等）
+# 2. 修改 .env 配置（MATLAB_WORKING_DIR、PYTHON_PATH、MCP_TOKEN 等）
+#    matlab 需在 PATH 中，或通过 .env 的 MATLAB_EXE 指定
 
-# 4. 启动服务
+# 3. 启动服务
 python matlab_mcp_server.py
 # 或双击 start_server.bat
 ```
@@ -42,14 +39,19 @@ python matlab_mcp_server.py
 {
   "mcpServers": {
     "matlab": {
-      "type": "sse",
-      "url": "http://100.x.y.z:8080/sse?token=YOUR_TOKEN"
+      "type": "http",
+      "url": "http://100.x.y.z:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
     }
   }
 }
 ```
 
-## 工具清单 (21 个)
+> 认证仅走请求头 `Authorization: Bearer`，不支持 query 参数携带 token。
+
+## 工具清单 (17 个)
 
 | 类别 | 工具 | 说明 |
 |------|------|------|
@@ -58,13 +60,13 @@ python matlab_mcp_server.py
 | 执行 | `submit_task` | 提交异步后台任务（>30分钟实验） |
 | 实验 | `experiment` | 参数化实验 + raw_code 双模式 |
 | 任务 | `get_task_status` / `get_task_output` / `cancel_task` / `list_tasks` | 后台任务生命周期管理 |
-| 工作区 | `inspect` | 查看工作区/变量值/struct 结构 |
-| 工作区 | `set_variable` | 设置变量 |
-| 图形 | `save_figure` / `get_figure_info` | 导出图形 / 获取元数据 |
+| 历史 | `get_history` | 查看已完成任务历史记录 |
+| 工作区 | `inspect` | 查看 .m 脚本/工作区变量/struct 结构 |
+| 图形 | `save_figure` | 导出图形 |
 | 文件 | `transfer_file` / `upload_file` / `list_files` | 文件传输与管理 |
 | 质量 | `lint_code` | MATLAB checkcode 静态检查 |
 | 诊断 | `diagnose` | 系统诊断（quick/full） |
-| 管理 | `sync_status` / `reset_session` / `change_directory` / `force_restart_engine` | 同步/重置/切换/重启 |
+| 管理 | `sync_status` | 同步状态检查 |
 
 ### 工具选择指南
 
@@ -78,13 +80,13 @@ python matlab_mcp_server.py
 ## 项目结构
 
 ```
-├── matlab_mcp_server.py      # 主服务（21 个 MCP 工具，~1879 行）
+├── matlab_mcp_server.py      # 主服务（17 个 MCP 工具，~1150 行）
 ├── mcp_run_experiment.m      # MATLAB 实验执行器（含 manifest + 种子管理）
-├── cleanup_and_start.py      # 安全启动器（清理残留进程）
-├── config.py                 # 配置兜底
-├── .env                      # 环境变量配置（优先级最高）
+├── cleanup_and_start.py      # 安全启动器（清理残留的 matlab -batch 进程）
+├── config.py                 # 配置兜底（.env 为唯一权威）
+├── .env                      # 环境变量配置（唯一权威，不入库）
 ├── requirements.txt          # Python 依赖
-├── test_smoke.py             # 冒烟测试（19 个用例）
+├── test_smoke.py             # 冒烟测试（调度器/认证/路径沙箱）
 │
 ├── start_server.bat          # Windows 快速启动
 ├── install_service.bat       # NSSM 服务安装（开机自启）
@@ -103,7 +105,7 @@ python matlab_mcp_server.py
 
 ## 配置优先级
 
-环境变量 > `.env` 文件 > `config.py` > 代码默认值
+`.env` 文件为**唯一权威**配置源，`config.py` 仅作兜底默认值。
 
 关键配置项（在 `.env` 中设置）：
 
@@ -112,25 +114,28 @@ python matlab_mcp_server.py
 | `MATLAB_WORKING_DIR` | `E:\code\Paper2` | MATLAB 工作目录 |
 | `MCP_HOST` | `0.0.0.0` | 监听地址 |
 | `MCP_PORT` | `8080` | 监听端口 |
-| `MCP_TOKEN` | (空) | Bearer Token 认证 |
-| `EXEC_TIMEOUT` | `600` | 默认执行超时（秒） |
+| `MCP_TOKEN` | (空) | Bearer Token 认证（强烈建议设置） |
+| `TASK_TIMEOUT_DEFAULT` | `600` | 默认执行超时（秒） |
+| `MAX_CONCURRENT_TASKS` | `3` | 最大并发 MATLAB 进程数 |
 | `MAX_QUEUE_SIZE` | `5` | 最大排队任务数 |
 | `CPU_THRESHOLD` | `90` | CPU 拒绝阈值 (%) |
-| `MEMORY_THRESHOLD` | `85` | 内存拒绝阈值 (%) |
-| `LOG_DIR` | 脚本所在目录 | 日志输出目录 |
+| `MEMORY_THRESHOLD` | `90` | 内存拒绝阈值 (%) |
+| `DISK_THRESHOLD` | `95` | 磁盘警告阈值 (%) |
+| `LOG_DIR` | 脚本目录\logs | 日志输出目录 |
+
+## 技术栈
+
+- Python 3.9+（无需 MATLAB Engine API）
+- MCP SDK (FastMCP) + Streamable HTTP transport
+- Tailscale (WireGuard) + Syncthing
+- NSSM (Windows 服务) + Git LFS
 
 ## 运行测试
 
 ```bash
-python test_smoke.py
+python test_smoke.py   # 冒烟测试（含调度器/认证/路径沙箱）
+python test_connection.py --token YOUR_TOKEN   # 连接测试（真实握手）
 ```
-
-## 技术栈
-
-- Python 3.8-3.10 + MATLAB Engine API (R2022b)
-- MCP SDK (FastMCP) + SSE transport
-- Tailscale (WireGuard) + Syncthing
-- NSSM (Windows 服务) + Git LFS
 
 ## 文档
 

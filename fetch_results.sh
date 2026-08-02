@@ -1,15 +1,21 @@
 #!/bin/bash
 # ============================================================
 #  fetch_results.sh - 从 Windows 拉取实验结果到 Mac
-#  通过 MCP transfer_file 接口按需拉取
+#  默认打印操作提示；设 REAL=1 时通过 MCP transfer_file 实际拉取。
 #  用法: ./fetch_results.sh <远程路径> [本地保存路径]
+#  真实模式: REAL=1 ./fetch_results.sh <远程路径> [本地保存路径]
+#  依赖: python3 + mcp_cli.py (标准库，无第三方包)
 # ============================================================
 
 set -e
 
 # ============ 配置 ============
 MCP_URL="${MCP_URL:-http://100.64.0.0:8080}"
-# 结果分析通过 MCP 远程完成，无需同步到本地
+MCP_TOKEN="${MCP_TOKEN:-}"
+MCP_CLI="$(dirname "$0")/mcp_cli.py"
+# 真实调用开关：REAL=1 时通过 MCP transfer_file 实际拉取文件
+# 默认关闭（仅打印提示），避免误发起远端请求。
+REAL="${REAL:-0}"
 # ==============================
 
 GREEN='\033[0;32m'
@@ -44,11 +50,21 @@ if [ "$1" = "--list" ]; then
     DIR="${2:-.}"
     echo -e "${YELLOW}列出远程目录: $DIR${NC}"
     echo ""
+    if [ "$REAL" = "1" ]; then
+        echo -e "${GREEN}[真实调用]${NC} list_files(directory='$DIR')"
+        python3 "$MCP_CLI" call list_files "{\"directory\": \"$DIR\"}" \
+            --url "$MCP_URL" --token "$MCP_TOKEN"
+        exit 0
+    fi
     echo "在 Qoder 中说: \"列出 Windows 上 $DIR 目录的文件\""
     echo "或使用 MCP list_files 工具"
     echo ""
-    echo "curl 方式 (需 MCP 客户端支持):"
-    echo "  通过 Qoder 调用 list_files(directory='$DIR')"
+    if [ -x "$(command -v python3)" ]; then
+      echo -e "${YELLOW}可选真实调用 (REAL=1):${NC}"
+      echo "  REAL=1 $0 --list $DIR"
+      echo ""
+      echo "  python3 mcp_cli.py call list_files '{\"directory\":\"$DIR\"}'"
+    fi
     exit 0
 fi
 
@@ -62,6 +78,15 @@ echo ""
 # 确保本地目录存在
 mkdir -p "$(dirname "$LOCAL_PATH")"
 
+# 真实调用：通过 MCP transfer_file 实际拉取并保存
+if [ "$REAL" = "1" ]; then
+    echo -e "${GREEN}[真实调用]${NC} transfer_file(file_path='$REMOTE_PATH')"
+    python3 "$MCP_CLI" transfer "$REMOTE_PATH" "$LOCAL_PATH" \
+        --url "$MCP_URL" --token "$MCP_TOKEN"
+    echo -e "${GREEN}✓ 文件已保存到: $LOCAL_PATH${NC}"
+    exit 0
+fi
+
 echo -e "${GREEN}提示: 在 Qoder 中说以下话即可拉取:${NC}"
 echo ""
 echo "  \"从 Windows 下载文件 $REMOTE_PATH\""
@@ -69,6 +94,12 @@ echo ""
 echo "MCP 工具调用:"
 echo "  transfer_file(file_path='$REMOTE_PATH')"
 echo ""
+if [ -x "$(command -v python3)" ]; then
+  echo -e "${YELLOW}可选真实调用 (REAL=1):${NC}"
+  echo "  REAL=1 $0 '$REMOTE_PATH' '$LOCAL_PATH'"
+  echo ""
+fi
+
 echo "拉取后文件保存在: $LOCAL_PATH"
 echo ""
 echo "============================================================"
