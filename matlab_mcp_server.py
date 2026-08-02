@@ -175,16 +175,22 @@ def _matlab_string_escape(s: str) -> str:
     return s.replace("\\", "/").replace("'", "''")
 
 
-def _write_temp_script(code: str, task_id: str) -> str:
-    """将 MATLAB 代码写入临时 .m 文件，返回文件路径"""
-    script_name = f"_mcp_task_{task_id}.m"
-    script_path = os.path.join(MATLAB_WORKING_DIR, script_name)
-    # 包裹代码：添加 cd 和错误捕获（工作目录统一用正斜杠 + 单引号转义）
+def _matlab_script_encoding() -> str:
+    """返回 MATLAB 脚本文件的写入编码。
+
+    Windows 上使用 utf-8-sig（带 BOM），确保 MATLAB 正确识别 UTF-8，
+    而非回退到系统 ANSI 代码页（中文 Windows 为 GBK/CP936）。
+    """
+    return "utf-8-sig" if os.name == "nt" else "utf-8"
+
+
+def _build_wrapped_code(code: str) -> str:
+    """构建包含 cd + try/catch 的完整 MATLAB 执行代码。"""
     workdir = _matlab_string_escape(MATLAB_WORKING_DIR)
     wrapped = f"cd('{workdir}');\n"
     wrapped += "try\n"
-    # 首行空行防护：剔除前导空行/空白，保证 try 块缩进正确；空代码给出占位语句
-    body = code.lstrip("\r\n \t")
+    # 统一换行符，防止 \r\n 输入在 Windows text 模式下产生 \r\r\n
+    body = code.replace("\r\n", "\n").replace("\r", "\n").lstrip("\n \t")
     if not body:
         body = "disp('(empty script)')"
     for line in body.split("\n"):
@@ -196,7 +202,16 @@ def _write_temp_script(code: str, task_id: str) -> str:
     wrapped += "    end\n"
     wrapped += "    exit(1);\n"
     wrapped += "end\n"
-    with open(script_path, "w", encoding="utf-8") as f:
+    return wrapped
+
+
+def _write_temp_script(code: str, task_id: str) -> str:
+    """将 MATLAB 代码写入临时 .m 文件，返回文件路径"""
+    script_name = f"_mcp_task_{task_id}.m"
+    script_path = os.path.join(MATLAB_WORKING_DIR, script_name)
+    os.makedirs(MATLAB_WORKING_DIR, exist_ok=True)
+    wrapped = _build_wrapped_code(code)
+    with open(script_path, "w", encoding=_matlab_script_encoding()) as f:
         f.write(wrapped)
     return script_path
 
@@ -403,13 +418,20 @@ class TaskScheduler:
             self._move_to_history(task)
             return
 
-        # 写入临时脚本
-        script_path = _write_temp_script(task.code, task.task_id)
-        script_name = os.path.splitext(os.path.basename(script_path))[0]
+        wrapped = _build_wrapped_code(task.code)
+        script_path = None
+
+        # 短代码直接通过 -batch 命令行传递（绕过临时文件编码问题）；
+        # 长代码写入临时 .m 文件（Windows 下带 UTF-8 BOM）
+        if len(wrapped) <= 8000:
+            batch_arg = wrapped
+        else:
+            script_path = _write_temp_script(task.code, task.task_id)
+            batch_arg = os.path.splitext(os.path.basename(script_path))[0]
 
         try:
             proc = subprocess.Popen(
-                [matlab_exe, "-batch", script_name],
+                [matlab_exe, "-batch", batch_arg],
                 cwd=task.working_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -435,7 +457,8 @@ class TaskScheduler:
             with self._lock:
                 self.active.pop(task.task_id, None)
             self._move_to_history(task)
-            _cleanup_temp_script(task.task_id)
+            if script_path:
+                _cleanup_temp_script(task.task_id)
 
     def _read_output(self, task: ManagedTask):
         """后台线程：实时读取子进程输出"""
@@ -665,9 +688,13 @@ def run_script(script_path: str, section: str = "") -> str:
         return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
 
     if section and section.lower() == "list":
-        # 列出段落
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        # 列出段落（先尝试 UTF-8，回退系统编码以兼容 GBK 等旧文件）
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            with open(resolved, "r", encoding="gbk", errors="replace") as f:
+                content = f.read()
         sections = []
         for line in content.split("\n"):
             if line.strip().startswith("%%"):
@@ -680,8 +707,12 @@ def run_script(script_path: str, section: str = "") -> str:
     script_name = os.path.splitext(os.path.basename(resolved))[0]
     if section:
         # 提取指定段落
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            with open(resolved, "r", encoding="gbk", errors="replace") as f:
+                content = f.read()
         lines = content.split("\n")
         sec_lines = []
         sec_idx = -1
@@ -703,7 +734,7 @@ def run_script(script_path: str, section: str = "") -> str:
             return _error_response("INVALID_SECTION", f"段落索引 {sec_idx} 超出范围 (0-{len(sec_lines)-1})")
         code = "\n".join(sec_lines[sec_idx])
     else:
-        code = f"run('{resolved}')"
+        code = f"run('{_matlab_string_escape(resolved)}')"
 
     # 同步执行（复用 run 逻辑）
     task = ManagedTask(code=code, timeout=TASK_TIMEOUT_DEFAULT, priority=0)
@@ -889,15 +920,17 @@ def experiment(algo: str = "HeteroPSO-KR", models: str = "1:56", n_runs: int = 1
                     pairs.append(f"'{k.strip()}', {v.strip()}")
             if pairs:
                 extra_opts = f"struct({', '.join(pairs)})"
+        algo_esc = algo.replace("'", "''")
+        output_base_esc = output_base.replace("'", "''")
         code = f"""
 addpath(fullfile(pwd, 'aux_files'));
 addpath(fullfile(pwd, 'methods'));
 addpath(fullfile(pwd, 'utils'));
 mcpOpts = struct();
-mcpOpts.algo = '{algo}';
+mcpOpts.algo = '{algo_esc}';
 mcpOpts.models = {models};
 mcpOpts.n_runs = {n_runs};
-mcpOpts.output_dir = '{output_base}';
+mcpOpts.output_dir = '{output_base_esc}';
 mcpOpts.seed = {seed};
 mcpOpts.extra_opts = {extra_opts};
 mcp_run_experiment(mcpOpts);
@@ -926,7 +959,7 @@ def inspect(file_path: str) -> str:
     if not os.path.exists(resolved):
         return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
 
-    code = f"whos('-file', '{resolved}')"
+    code = f"whos('-file', '{_matlab_string_escape(resolved)}')"
     task = ManagedTask(code=code, timeout=120, priority=0)
     scheduler.submit(task)
     if not _join_task_sync(task):
@@ -954,7 +987,7 @@ def lint_code(code: str = "", file_path: str = "") -> str:
         if not os.path.exists(resolved):
             return _error_response("FILE_NOT_FOUND", f"文件不存在: {resolved}")
         matlab_code = f"""
-issues = checkcode('{resolved}');
+issues = checkcode('{_matlab_string_escape(resolved)}');
 if isempty(issues), fprintf('未发现问题\\n');
 else
   fprintf('发现 %d 个问题:\\n', length(issues));
@@ -963,16 +996,17 @@ end"""
     elif code:
         # 写入临时文件再检查
         tmp = os.path.join(MATLAB_WORKING_DIR, "_mcp_lint_tmp.m")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding=_matlab_script_encoding()) as f:
             f.write(code)
+        tmp_esc = _matlab_string_escape(tmp)
         matlab_code = f"""
-issues = checkcode('{tmp}');
+issues = checkcode('{tmp_esc}');
 if isempty(issues), fprintf('未发现问题\\n');
 else
   fprintf('发现 %d 个问题:\\n', length(issues));
   for i = 1:length(issues), fprintf('  L%d: %s\\n', issues(i).line, issues(i).message); end
 end
-delete('{tmp}');"""
+delete('{tmp_esc}');"""
     else:
         return "[错误] 请提供 code 或 file_path"
 
@@ -1059,11 +1093,12 @@ def save_figure(figure_code: str, filename: str = "", format: str = "png", dpi: 
         filename = f"figure_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     filename = os.path.basename(filename)  # 防目录穿越
     export_path = f"exports/{filename}.{format}"
+    export_path_esc = _matlab_string_escape(export_path)
     code = f"""
 {figure_code}
 if ~exist('exports', 'dir'), mkdir('exports'); end
-exportgraphics(gcf, '{export_path}', 'Resolution', {dpi});
-fprintf('图片已保存: {export_path}\\n');
+exportgraphics(gcf, '{export_path_esc}', 'Resolution', {dpi});
+fprintf('图片已保存: {export_path_esc}\\n');
 """
     task = ManagedTask(code=code, timeout=300, priority=0)
     scheduler.submit(task)
