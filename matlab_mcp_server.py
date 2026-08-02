@@ -1190,10 +1190,9 @@ if __name__ == "__main__":
 
     # 启动服务
     import uvicorn
-    from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import JSONResponse
-    from starlette.routing import Route, Mount
+    from starlette.routing import Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     async def health_check(request: Request):
@@ -1243,11 +1242,12 @@ if __name__ == "__main__":
     else:
         mcp_app = mcp.sse_app()
 
+    # 健康检查路由直接挂到 MCP app 上，不能用外层 Starlette 包裹 Mount：
+    # 外层 app 会接管 lifespan，导致 MCP 子应用的 lifespan 不触发，
+    # StreamableHTTPSessionManager 未初始化，所有 /mcp 请求返回 500。
+    mcp_app.routes.append(Route("/health", health_check))
+
     if MCP_TOKEN:
         mcp_app = BearerTokenMiddleware(mcp_app, MCP_TOKEN)
 
-    app = Starlette(routes=[
-        Route("/health", health_check),
-        Mount("/", app=mcp_app),
-    ])
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(mcp_app, host=HOST, port=PORT, log_level="warning")

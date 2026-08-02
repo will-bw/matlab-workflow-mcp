@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "matlab": {
-      "type": "sse",
-      "url": "http://100.97.154.104:8080/sse"
+      "type": "streamable-http",
+      "url": "http://100.97.154.104:8080/mcp"
     }
   }
 }
