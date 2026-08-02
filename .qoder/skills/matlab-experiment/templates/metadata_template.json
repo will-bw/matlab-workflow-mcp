@@ -1,0 +1,59 @@
+{
+  "experiment_id": "",
+  "title": "",
+  "created_at": "",
+  "completed_at": null,
+  "status": "designed",
+
+  "purpose": {
+    "hypothesis": "",
+    "expected_outcome": "",
+    "paper_section": ""
+  },
+
+  "type": "",
+
+  "design": {
+    "groups": [],
+    "scenarios": "",
+    "n_runs": 15,
+    "random_seed": 42,
+    "independent_variables": [],
+    "dependent_variables": [],
+    "control_variables": []
+  },
+
+  "execution": {
+    "remote_working_dir": "",
+    "tasks": [],
+    "total_duration_seconds": 0,
+    "matlab_version": "",
+    "parallel_slots_used": 1
+  },
+
+  "code": {
+    "main_script": "code/main.m",
+    "additional_files": [],
+    "code_hash": ""
+  },
+
+  "results": {
+    "remote_path": "",
+    "local_path": "",
+    "summary": {
+      "total_executions": 0,
+      "successful": 0,
+      "failed": 0,
+      "key_metrics": {}
+    }
+  },
+
+  "lineage": {
+    "parent_id": null,
+    "related_ids": [],
+    "supersedes": null
+  },
+
+  "tags": [],
+  "notes": ""
+}

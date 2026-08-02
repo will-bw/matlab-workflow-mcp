@@ -633,6 +633,15 @@ async def run(code: str, timeout: int = 0, description: str = "") -> str:
     if not accepted:
         return _error_response("QUEUE_FULL", msg)
 
+    # 前台任务被排队 = 所有进程忙，立即告知用户（而非静默等待 600s）
+    if task.status == "queued":
+        with scheduler._lock:
+            active_ids = list(scheduler.active.keys())
+        return _error_response("ALL_PROCESSES_BUSY",
+            f"所有 {MAX_CONCURRENT_TASKS} 个 MATLAB 进程正忙，前台命令已入队。",
+            hint=f"当前运行: {active_ids}。等待完成或 cancel_task 释放槽位；"
+                 f"也可稍后重试。任务 {task.task_id} 已在队列中。")
+
     start_time = datetime.now()
     HEARTBEAT = 30
 
@@ -798,12 +807,17 @@ def get_task_status(task_id: str = "") -> str:
 
     import json
     result = task.to_summary()
+    # 进度指标：输出行数 + 最后一行（便于判断长任务进展）
+    output_lines = task.output_lines
+    last_line = output_lines[-1] if output_lines else ""
     json_block = json.dumps({
         "task_id": task.task_id,
         "status": task.status,
         "elapsed": task.elapsed,
         "wait_time": task.wait_time,
-        "has_output": bool(task.get_output()),
+        "has_output": bool(output_lines),
+        "output_line_count": len(output_lines),
+        "last_output": last_line[:200],
     }, ensure_ascii=False)
     result += f"\n---JSON---\n{json_block}"
     return result
@@ -1026,16 +1040,20 @@ def list_files(directory: str = ".", pattern: str = "*") -> str:
         d = MATLAB_WORKING_DIR if directory == "." else _resolve_workspace_path(directory)
         if not os.path.exists(d):
             return f"[错误] 目录不存在: {d}"
+        dirs = []
         files = []
         for f in sorted(Path(d).glob(pattern)):
-            if f.is_file():
+            if f.is_dir():
+                dirs.append(f"  📁 {f.name}/")
+            elif f.is_file():
                 size = f.stat().st_size
                 mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 sz = f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.1f} KB" if size > 1024 else f"{size} B"
                 files.append(f"  {f.name:<40} {sz:>10}  {mtime}")
-        if not files:
-            return f"[目录 {d} 中没有匹配 '{pattern}' 的文件]"
-        return f"[目录: {d}] ({len(files)} 个文件)\n" + "\n".join(files)
+        if not dirs and not files:
+            return f"[目录 {d} 中没有匹配 '{pattern}' 的文件或子目录]"
+        header = f"[目录: {d}] ({len(dirs)} 个子目录, {len(files)} 个文件)\n"
+        return header + "\n".join(dirs + files)
     except Exception as e:
         return f"[错误] {str(e)}"
 
@@ -1217,10 +1235,33 @@ if __name__ == "__main__":
     logger.info(f"  并发: {MAX_CONCURRENT_TASKS} | 队列: {MAX_QUEUE_SIZE}")
     logger.info(f"  认证: {'已启用' if MCP_TOKEN else '未启用'}")
     try:
-        logger.info(f"  MATLAB: {_find_matlab_exe()}")
+        matlab_exe = _find_matlab_exe()
+        logger.info(f"  MATLAB: {matlab_exe}")
     except FileNotFoundError:
         logger.error("  MATLAB: 未找到！请设置 MATLAB_EXE")
         sys.exit(1)
+
+    # 启动编码自检：确认 MATLAB 能正确执行通过当前编码写入的脚本
+    if os.name == "nt":
+        try:
+            _test_script = os.path.join(MATLAB_WORKING_DIR, "_mcp_encoding_test.m")
+            os.makedirs(MATLAB_WORKING_DIR, exist_ok=True)
+            with open(_test_script, "w", encoding=_matlab_script_encoding()) as _f:
+                _f.write("disp('ENCODING_OK')\n")
+            _r = subprocess.run(
+                [matlab_exe, "-batch", "_mcp_encoding_test"],
+                cwd=MATLAB_WORKING_DIR, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=90
+            )
+            os.remove(_test_script)
+            if "ENCODING_OK" in _r.stdout:
+                logger.info("  编码自检: ✓ 通过")
+            else:
+                logger.warning(f"  编码自检: ⚠ MATLAB 输出异常: {_r.stdout[:100]}")
+        except subprocess.TimeoutExpired:
+            logger.warning("  编码自检: ⚠ 超时（不影响启动）")
+        except Exception as _e:
+            logger.warning(f"  编码自检: ⚠ 跳过 ({_e})")
     logger.info("=" * 60)
 
     # 启动服务
