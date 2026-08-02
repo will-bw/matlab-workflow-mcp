@@ -35,10 +35,13 @@ def kill_matlab_processes():
                 ["wmic", "process", "where",
                  "name='MATLAB.exe'",
                  "get", "ProcessId,CommandLine", "/format:csv"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                errors="replace"  # 中文本地代码页(GBK)输出可被安全解码，避免 UnicodeDecodeError
             )
             engine_pids = []
-            for line in result.stdout.splitlines():
+            # errors=replace 后 stdout 不为 None；仍做防御以免读线程异常
+            stdout = result.stdout or ""
+            for line in stdout.splitlines():
                 # 本服务启动的 MATLAB 进程命令行包含 -batch 标志
                 if "MATLAB.exe" in line and "-batch" in line:
                     parts = line.strip().split(",")
@@ -58,9 +61,10 @@ def kill_matlab_processes():
                 # 回退: 如果 wmic 不可用，检查是否有 MATLAB 进程
                 result = subprocess.run(
                     ["tasklist", "/FI", "IMAGENAME eq MATLAB.exe", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, text=True, timeout=10,
+                    errors="replace"
                 )
-                if "MATLAB.exe" in result.stdout:
+                if result.stdout and "MATLAB.exe" in result.stdout:
                     logger.warning(
                         "检测到 MATLAB 进程但无法确认是否为 batch 进程。"
                         "为避免误杀用户交互式 MATLAB，不执行强杀。"
