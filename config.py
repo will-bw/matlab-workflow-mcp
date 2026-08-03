@@ -42,6 +42,10 @@ CPU_THRESHOLD = float(os.environ.get("CPU_THRESHOLD", "90"))
 # 内存使用率超过此值时不再启动新任务
 MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", "90"))
 
+# 可用内存低于此值(GB)时不再启动新 MATLAB 进程
+# 16GB 机器建议 4；防止内存耗尽导致 MATLAB 堆损坏崩溃(0xC0000374)
+MIN_FREE_MEMORY_GB = float(os.environ.get("MIN_FREE_MEMORY_GB", "4"))
+
 # 磁盘使用率超过此值时警告
 DISK_THRESHOLD = float(os.environ.get("DISK_THRESHOLD", "95"))
 

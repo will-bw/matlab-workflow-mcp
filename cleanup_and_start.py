@@ -71,20 +71,28 @@ def kill_matlab_processes():
                         "如需强制清理，请手动执行: taskkill /F /IM MATLAB.exe"
                     )
         except FileNotFoundError:
-            # wmic 在 Windows 11 24H2+ 已移除，回退到 PowerShell
+            # wmic 在 Windows 11 24H2+ 已移除，回退到 PowerShell。
+            # 注意：Get-Process 对象没有 CommandLine 属性，必须用 Get-CimInstance
+            # 获取命令行，否则过滤条件恒为假，一个进程都杀不掉（旧版 bug）。
             try:
                 ps_cmd = (
-                    "Get-Process MATLAB -ErrorAction SilentlyContinue | "
+                    "Get-CimInstance Win32_Process -Filter \"Name='MATLAB.exe'\" | "
                     "Where-Object {$_.CommandLine -like '*-batch*'} | "
-                    "Stop-Process -Force"
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"
                 )
-                subprocess.run(
-                    ["powershell", "-Command", ps_cmd],
-                    capture_output=True, timeout=10
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, text=True, timeout=30,
+                    errors="replace"
                 )
-                killed += 1
-            except Exception:
-                pass
+                ps_killed = len([x for x in (r.stdout or "").split() if x.strip().isdigit()])
+                if ps_killed:
+                    killed += ps_killed
+                    time.sleep(2)
+                else:
+                    logger.info("PowerShell 回退: 未发现 matlab -batch 残留进程")
+            except Exception as e:
+                logger.warning(f"PowerShell 回退清理失败: {e}")
         except Exception as e:
             logger.warning(f"清理 MATLAB 进程时出错: {e}")
     else:

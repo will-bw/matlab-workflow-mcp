@@ -69,6 +69,7 @@ try:
         MAX_CONCURRENT_TASKS as _CFG_MAX_TASKS, MAX_QUEUE_SIZE as _CFG_MAX_QUEUE,
         TASK_TIMEOUT_DEFAULT as _CFG_TIMEOUT, CPU_THRESHOLD as _CFG_CPU,
         MEMORY_THRESHOLD as _CFG_MEM, DISK_THRESHOLD as _CFG_DISK,
+        MIN_FREE_MEMORY_GB as _CFG_MIN_FREE,
         MCP_TOKEN as _CFG_TOKEN,
     )
     _cfg = True
@@ -86,6 +87,8 @@ TASK_TIMEOUT_DEFAULT = int(os.environ.get("TASK_TIMEOUT_DEFAULT", str(_CFG_TIMEO
 CPU_THRESHOLD = float(os.environ.get("CPU_THRESHOLD", str(_CFG_CPU if _cfg else 85)))
 MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", str(_CFG_MEM if _cfg else 80)))
 DISK_THRESHOLD = float(os.environ.get("DISK_THRESHOLD", str(_CFG_DISK if _cfg else 95)))
+# 可用内存低于此值(GB)时不启动新 MATLAB 进程（防止内存耗尽导致 MATLAB 堆损坏崩溃）
+MIN_FREE_MEMORY_GB = float(os.environ.get("MIN_FREE_MEMORY_GB", str(_CFG_MIN_FREE if _cfg else 4.0)))
 MCP_TOKEN = os.environ.get("MCP_TOKEN", _CFG_TOKEN if _cfg else "")
 
 # ============ MCP Server 初始化 ============
@@ -110,6 +113,73 @@ def _error_response(error_type: str, message: str, elapsed: float = 0, hint: str
 
 
 MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+
+# Windows 进程异常终止退出码（NTSTATUS 有符号 32 位表示）
+_CRASH_EXIT_CODES = {
+    -1073740940: "HEAP_CORRUPTION (0xC0000374)",
+    -1073741819: "ACCESS_VIOLATION (0xC0000005)",
+    -1073740791: "STACK_BUFFER_OVERRUN (0xC0000409)",
+    -1073741515: "DLL_NOT_FOUND (0xC0000135)",
+    -1073740928: "COMMITMENT_LIMIT / 内存耗尽 (0xC0000410)",
+}
+
+
+def _describe_crash(exit_code) -> str:
+    """将异常退出码转为可读的崩溃描述；正常退出返回空串"""
+    if exit_code is None or exit_code == 0:
+        return ""
+    if exit_code in _CRASH_EXIT_CODES:
+        return _CRASH_EXIT_CODES[exit_code]
+    if os.name == "nt" and exit_code < 0:
+        return f"CRASH (NTSTATUS 0x{exit_code & 0xFFFFFFFF:08X})"
+    return ""
+
+
+def _kill_process_tree(proc: "subprocess.Popen"):
+    """终止子进程整棵进程树。
+
+    Windows 上 matlab.exe 只是启动器，真实计算进程是其子进程；
+    单纯 proc.kill()（TerminateProcess）只杀启动器，会泄漏真实引擎进程。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+            return
+        except Exception:
+            pass
+    else:
+        try:
+            import psutil
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                child.kill()
+            parent.kill()
+            return
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _make_task_tmpdir(task_id: str) -> str:
+    """为任务创建独立 TEMP 目录（避免多个 MATLAB 实例共享 %TEMP% 引发冲突）"""
+    import tempfile as _tf
+    d = os.path.join(_tf.gettempdir(), "mcp_matlab", task_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cleanup_task_tmpdir(tmp_dir: str):
+    if not tmp_dir:
+        return
+    try:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _resolve_workspace_path(file_path: str) -> str:
@@ -265,6 +335,8 @@ def _resources_ok() -> tuple:
         warnings.append(f"CPU {res['cpu_percent']:.0f}% > {CPU_THRESHOLD:.0f}%")
     if res["memory_percent"] >= 0 and res["memory_percent"] > MEMORY_THRESHOLD:
         warnings.append(f"内存 {res['memory_percent']:.0f}% > {MEMORY_THRESHOLD:.0f}%")
+    if res["memory_available_gb"] >= 0 and res["memory_available_gb"] < MIN_FREE_MEMORY_GB:
+        warnings.append(f"可用内存 {res['memory_available_gb']}GB < {MIN_FREE_MEMORY_GB:.0f}GB")
     if res["disk_percent"] >= 0 and res["disk_percent"] > DISK_THRESHOLD:
         warnings.append(f"磁盘 {res['disk_percent']:.0f}% > {DISK_THRESHOLD:.0f}%")
     ok = len(warnings) == 0
@@ -294,10 +366,13 @@ class ManagedTask:
         self.start_time = None
         self.end_time = None
         self.process = None  # subprocess.Popen
-        self.output_lines = []  # 实时输出
+        # 有界缓冲：防止长时间实验输出无限增长拖垮 Python 内存
+        self.output_lines = collections.deque(maxlen=20000)  # 实时输出
         self._output_lock = threading.Lock()
+        self._state_lock = threading.Lock()  # 保证终态(status)只被写入一次
         self._done_event = threading.Event()
         self.exit_code = None
+        self.temp_dir = ""  # 本任务独立 TEMP 目录（进程退出后清理）
 
     @property
     def done(self) -> bool:
@@ -338,12 +413,13 @@ class ManagedTask:
             self.output_lines.append(line)
 
     def mark_done(self, status: str):
-        if self._done_event.is_set():
-            # 终态只允许写入一次（并发取消/超时/完成时保证幂等）
-            return
-        self.status = status
-        self.end_time = datetime.now()
-        self._done_event.set()
+        with self._state_lock:
+            if self._done_event.is_set():
+                # 终态只允许写入一次（并发取消/超时/完成时保证幂等）
+                return
+            self.status = status
+            self.end_time = datetime.now()
+            self._done_event.set()
 
     def to_summary(self) -> str:
         icons = {"queued": "⏳", "running": "🔄", "completed": "✅",
@@ -365,7 +441,9 @@ class TaskScheduler:
         self.queue: collections.deque = collections.deque()  # waiting tasks
         self.history: dict[str, ManagedTask] = {}  # finished tasks
         self._lock = threading.RLock()  # 可重入，便于在持锁时安全调用 _move_to_history 等
-        self._reader_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS + 2)
+        # 每个运行中任务占用 2 个常驻线程（输出读取 + 超时看门狗），
+        # worker 数必须 >= 2*并发数，否则第 N 个任务的线程会排队饿死
+        self._reader_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS * 2 + 2)
         # 启动后台调度线程
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
@@ -375,6 +453,8 @@ class TaskScheduler:
         """提交任务。Returns: (accepted: bool, message: str)"""
         launch_now = False
         launch_msg = ""
+        # 阻塞式资源采样放到锁外，避免持锁等待 psutil
+        res_ok, warnings = _resources_ok()
         with self._lock:
             running_count = len(self.active)
             queue_count = len(self.queue)
@@ -385,7 +465,6 @@ class TaskScheduler:
 
             # 尝试立即启动
             if running_count < MAX_CONCURRENT_TASKS:
-                res_ok, warnings = _resources_ok()
                 if res_ok or task.priority == 0:  # 前台任务强制启动
                     # 先占并发槽位，真实启动放到锁外（避免 Popen 耗时阻塞锁）
                     self.active[task.task_id] = task
@@ -429,10 +508,23 @@ class TaskScheduler:
             script_path = _write_temp_script(task.code, task.task_id)
             batch_arg = os.path.splitext(os.path.basename(script_path))[0]
 
+        # 每任务独立 TEMP：多个 MATLAB 实例共享 %TEMP% 时，
+        # 并行计算存储/临时文件互相竞争，是引擎崩溃的已知诱因
+        try:
+            task.temp_dir = _make_task_tmpdir(task.task_id)
+        except Exception:
+            task.temp_dir = ""
+        env = os.environ.copy()
+        if task.temp_dir:
+            env["TEMP"] = task.temp_dir
+            env["TMP"] = task.temp_dir
+
         try:
             proc = subprocess.Popen(
-                [matlab_exe, "-batch", batch_arg],
+                # -singleCompThread: 限制单实例 BLAS 线程数，避免多实例 CPU 超额订阅
+                [matlab_exe, "-singleCompThread", "-batch", batch_arg],
                 cwd=task.working_dir,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -459,6 +551,7 @@ class TaskScheduler:
             self._move_to_history(task)
             if script_path:
                 _cleanup_temp_script(task.task_id)
+            _cleanup_task_tmpdir(task.temp_dir)
 
     def _read_output(self, task: ManagedTask):
         """后台线程：实时读取子进程输出"""
@@ -470,13 +563,21 @@ class TaskScheduler:
             exit_code = task.process.returncode
             task.exit_code = exit_code
 
+            # 崩溃识别：Windows 下异常终止的退出码即 NTSTATUS，
+            # 如 0xC0000374 堆损坏，直接标注便于事后定位
+            crash = _describe_crash(exit_code)
+            if crash:
+                task.append_output(f"[CRASH] MATLAB 进程异常终止: {crash}")
+                logger.error(f"任务崩溃: [{task.task_id}] {crash}")
+
             if task.status == "cancelled":
                 pass  # 已被取消
+            elif task.status == "timeout":
+                pass  # 已被看门狗标记
             elif exit_code == 0:
                 task.mark_done("completed")
             else:
-                if task.status != "timeout":
-                    task.mark_done("failed")
+                task.mark_done("failed")
             logger.info(f"任务结束: [{task.task_id}] exit={exit_code} 耗时={task.elapsed}")
         except Exception as e:
             task.append_output(f"[输出读取异常] {str(e)}")
@@ -488,6 +589,7 @@ class TaskScheduler:
                 self.active.pop(task.task_id, None)
             self._move_to_history(task)
             _cleanup_temp_script(task.task_id)
+            _cleanup_task_tmpdir(task.temp_dir)
 
     def _watch_timeout(self, task: ManagedTask):
         """后台线程：超时监控"""
@@ -502,7 +604,7 @@ class TaskScheduler:
                     return
 
     def cancel(self, task_id: str, reason: str = "cancelled") -> bool:
-        """取消任务（排队中直接移除，运行中杀进程）"""
+        """取消任务（排队中直接移除，运行中杀整棵进程树）"""
         with self._lock:
             # 检查队列
             for t in self.queue:
@@ -511,13 +613,11 @@ class TaskScheduler:
                     t.mark_done("cancelled")
                     self._move_to_history(t)
                     return True
-            # 检查运行中
-            task = self.active.get(task_id)
+            # 检查运行中；立即从 active 移除，避免崩溃/挂死任务永久占用并发槽位
+            task = self.active.pop(task_id, None)
         if task and task.process:
-            try:
-                task.process.kill()
-            except Exception:
-                pass
+            # 必须整树终止：仅杀 matlab.exe 启动器会泄漏真实引擎进程（~1GB/个）
+            _kill_process_tree(task.process)
             task.mark_done("timeout" if reason == "timeout" else "cancelled")
             return True
         return False
@@ -538,13 +638,14 @@ class TaskScheduler:
 
     def _try_dequeue(self):
         """尝试从队列中取出任务启动"""
+        # 阻塞式资源采样放到锁外
+        res_ok, _ = _resources_ok()
+        if not res_ok:
+            return
         with self._lock:
             if not self.queue:
                 return
             if len(self.active) >= MAX_CONCURRENT_TASKS:
-                return
-            res_ok, _ = _resources_ok()
-            if not res_ok:
                 return
             task = self.queue.popleft()
         # 在锁外启动
@@ -747,7 +848,9 @@ def run_script(script_path: str, section: str = "") -> str:
 
     # 同步执行（复用 run 逻辑）
     task = ManagedTask(code=code, timeout=TASK_TIMEOUT_DEFAULT, priority=0)
-    scheduler.submit(task)
+    accepted, msg = scheduler.submit(task)
+    if not accepted:
+        return _error_response("QUEUE_FULL", msg)
     if not _join_task_sync(task):
         return _error_response("TIMEOUT", f"执行超时（>{TASK_TIMEOUT_DEFAULT}s），任务已终止")
     output = task.get_output()
@@ -952,7 +1055,9 @@ mcp_run_experiment(mcpOpts);
     # 作为后台任务提交
     task = ManagedTask(code=code, description=f"experiment: {algo} models={models}",
                        timeout=TASK_TIMEOUT_DEFAULT * 6, priority=1)
-    scheduler.submit(task)
+    accepted, msg = scheduler.submit(task)
+    if not accepted:
+        return _error_response("QUEUE_FULL", msg)
     return f"[实验已提交] Task ID: {task.task_id}\n使用 get_task_status('{task.task_id}') 监控进度。"
 
 
@@ -975,7 +1080,9 @@ def inspect(file_path: str) -> str:
 
     code = f"whos('-file', '{_matlab_string_escape(resolved)}')"
     task = ManagedTask(code=code, timeout=120, priority=0)
-    scheduler.submit(task)
+    accepted, msg = scheduler.submit(task)
+    if not accepted:
+        return _error_response("QUEUE_FULL", msg)
     if not _join_task_sync(task):
         return _error_response("TIMEOUT", f"检查超时（>{task.timeout}s），任务已终止")
     output = task.get_output()
@@ -1008,8 +1115,9 @@ else
   for i = 1:length(issues), fprintf('  L%d: %s\\n', issues(i).line, issues(i).message); end
 end"""
     elif code:
-        # 写入临时文件再检查
-        tmp = os.path.join(MATLAB_WORKING_DIR, "_mcp_lint_tmp.m")
+        # 写入临时文件再检查（唯一文件名，避免并发 lint 互相覆盖）
+        import uuid
+        tmp = os.path.join(MATLAB_WORKING_DIR, f"_mcp_lint_tmp_{uuid.uuid4().hex[:8]}.m")
         with open(tmp, "w", encoding=_matlab_script_encoding()) as f:
             f.write(code)
         tmp_esc = _matlab_string_escape(tmp)
@@ -1025,7 +1133,9 @@ delete('{tmp_esc}');"""
         return "[错误] 请提供 code 或 file_path"
 
     task = ManagedTask(code=matlab_code, timeout=120, priority=0)
-    scheduler.submit(task)
+    accepted, msg = scheduler.submit(task)
+    if not accepted:
+        return _error_response("QUEUE_FULL", msg)
     if not _join_task_sync(task):
         return _error_response("TIMEOUT", f"检查超时（>{task.timeout}s），任务已终止")
     return truncate_output(task.get_output()) or "[检查完成]"
@@ -1119,7 +1229,9 @@ exportgraphics(gcf, '{export_path_esc}', 'Resolution', {dpi});
 fprintf('图片已保存: {export_path_esc}\\n');
 """
     task = ManagedTask(code=code, timeout=300, priority=0)
-    scheduler.submit(task)
+    accepted, msg = scheduler.submit(task)
+    if not accepted:
+        return _error_response("QUEUE_FULL", msg)
     if not _join_task_sync(task):
         return _error_response("TIMEOUT", f"出图超时（>{task.timeout}s），任务已终止")
     output = task.get_output()
